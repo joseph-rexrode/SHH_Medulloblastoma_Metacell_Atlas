@@ -1,0 +1,138 @@
+---
+title: "01 — SuperCell Integration"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+library(here)
+library(SuperCell)
+library(mclust)
+library(grid)
+library(pheatmap)
+library(dplyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+
+```
+
+
+## Import SuperCells
+
+```{r}
+
+sc_files <- list.files(
+  path = here(),
+  pattern = "_scObject\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+sc_files
+
+scs <- lapply(sc_files, readRDS)
+feature_list <- lapply(scs, rownames)
+
+shared.features <- Reduce(f = intersect, x = feature_list)
+
+scs_shared_only <- lapply(scs, function(obj) {
+  return(obj[shared.features, ])
+})
+
+scs_merged <- merge(x = scs_shared_only[[1]], y = scs_shared_only[-1])
+
+rm(scs)
+rm(scs_shared_only)
+
+```
+
+```{r}
+
+scs_merged <- NormalizeData(scs_merged) |> FindVariableFeatures() |> ScaleData() |> RunPCA()
+scs_merged <- RunHarmony(
+  scs_merged,
+  group.by.vars = c("dataset", "pt_id"),
+  theta = c(5, 2),
+  max_iter = 20
+)
+
+ndim <- 30
+  
+scs_merged <- FindNeighbors(
+    scs_merged,
+    reduction = "harmony",
+    dims = 1:ndim
+)
+  
+scs_merged <- FindClusters(
+    scs_merged,
+    resolution = 0.25,
+    random.seed = 20200204
+)
+  
+scs_merged <- RunUMAP(
+    scs_merged,
+    reduction = "harmony",
+    dims = 1:ndim,
+    seed.use = 20200204
+  )
+
+# subpop_colors <- c(
+#   "SHH-A1" = "red",
+#   "SHH-A2" = "orange",
+#   "SHH-B1" = "gold",
+#   "SHH-B2" = "green",
+#   "SHH-C1" = "skyblue",
+#   "SHH-C2" = "violet"
+# )
+
+combinedDimPlot <- DimPlot(
+    scs_merged,
+    reduction = "umap",
+    group.by = "RNA_snn_res.0.25"
+  ) +
+  labs(title = "Ghasemi + Riemondy: SC + Harmony by Cluster") +
+  guides(color = guide_legend(ncol = 1, override.aes = list(size = 5)))
+
+combined_byPatient <- DimPlot(
+  scs_merged,
+  reduction = "umap",
+  group.by = "dataset"
+) +
+  labs(title = "Ghasemi + Riemondy: SC + Harmony by Patient")
+  
+ggsave(file.path(here(),
+                 "Integration", 
+                 "results",
+                 "sc_combined_Dim_Plot.png"),
+       plot = combinedDimPlot,
+       width = 12,
+       height = 10,
+       bg = "white")
+
+ggsave(file.path(here(),
+                 "Integration",
+                 "results",
+                 "sc_combined_Dim_Plot_byPatient.png"),
+       plot = combined_byPatient,
+       width = 12,
+       height = 10,
+       bg = "white")
+
+
+```
+
+```{r}
+
+table(scs_merged$seurat_clusters, scs_merged$dataset)
+
+```
+
+
+
+
+
+

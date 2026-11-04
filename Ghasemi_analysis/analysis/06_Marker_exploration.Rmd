@@ -1,0 +1,126 @@
+---
+title: "06 - Marker Exploration"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+
+```
+
+```{r}
+
+combined <- readRDS(here("Ghasemi_analysis", "results", "combined", "combined.rds"))
+
+markers <- FindAllMarkers(
+  combined,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25)
+
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+top_marker_heatmap <- DoHeatmap(
+  combined,
+  features = unique(top_markers$gene),
+  group.by = "seurat_clusters"
+)
+
+
+gli2_featureplot <- FeaturePlot(object = combined, features = "GLI2")
+col3a1_featureplot <- FeaturePlot(object = combined, features = "COL3A1")
+npas3_featureplot <- FeaturePlot(object = combined, features = "NPAS3")
+vwf_featureplot <- FeaturePlot(object = combined, features = "VWF")
+olig2_featureplot <- FeaturePlot(object = combined, features = "OLIG2", order = T)
+
+early_cgnp_genes <- c("BARHLH1", "ZIC1", "ZIC3", "PTPRK", "PTCH1", "SMO", "HHIP", "GLI1", "GLI2")
+
+early_prolif_genes <- c("EZH2", "SUZ12", "CTCF", "YY1", "RAD21")
+
+inter_cgnp_genes <- c("GRIN2B", "CNTN2", "ASTN1", "SEMA6A")
+
+differ_cgnp_genes <- c("GABRA1", "GABRA6", "GRIN2C")
+
+
+perivas_genes <- c("COL3A1", "COLEC11", "SLC38A11", "VIM", 
+                   "MFGE8", "MYO1B", "PDGFRB", "NOTCH3")
+
+astro_genes <- c("AQP4", "GFAP", "NPAS3", "TNC", "APOE", "GJA1", 
+                 "SLC1A2", "SLC1A3", "FGFR3", "NKAIN4", "GPR37L1", 
+                 "SLC6A11", "PLXNB1", "S100B")
+
+perivas_featureplot <- DoHeatmap(object = combined, features = perivas_genes)
+
+early_cgnp_featplot <- DoHeatmap(object = combined, features = early_cgnp_genes)
+early_prolif_featplot <- DoHeatmap(object = combined, features = early_prolif_genes)
+
+inter_cgnp_featplot <- DoHeatmap(combined, features = inter_cgnp_genes)
+
+differ_cgnp_featplot <- DoHeatmap(combined, features = differ_cgnp_genes)
+
+astro_featplot <- DoHeatmap(combined, astro_genes)
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_gli2_plot.png"),
+       plot = gli2_featureplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_col3a1_plot.png"),
+       plot = col3a1_featureplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_npas3_plot.png"),
+       plot = npas3_featureplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_vwf_plot.png"),
+       plot = vwf_featureplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_olig2_plot.png"),
+       plot = olig2_featureplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_perivas_plot.png"),
+       plot = perivas_featureplot,
+       bg = "white",
+       width = 20)
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "top_markers.png"),
+       plot = top_marker_heatmap,
+       bg = "white",
+       width = 20)
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_earlycgnp_plot.png"),
+       plot = early_cgnp_featplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_earlyprolif_plot.png"),
+       plot = early_prolif_featplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_intercgnp_plot.png"),
+       plot = inter_cgnp_featplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_differcgnp_plot.png"),
+       plot = differ_cgnp_featplot,
+       bg = "white")
+
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_astro_plot.png"),
+       plot = astro_featplot,
+       bg = "white")
+
+# shows that cluster 0 likely represents the differentiated CGNP cluster
+# clusters 3 and 6 seem like likely early cgnp
+# 1 and 2 are likely intermediate cgnp
+# still not sure about cluster 4
+
+
+```

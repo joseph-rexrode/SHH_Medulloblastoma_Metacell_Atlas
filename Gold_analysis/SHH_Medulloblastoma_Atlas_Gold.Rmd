@@ -1,0 +1,360 @@
+---
+title: "SHH Medulloblastoma Gold Dataset"
+author: "George Kidane"
+date: default
+output:
+  html_document: default
+  md_document:
+    variant: markdown_github
+    html_preview: false
+  pdf_document: default
+---
+
+**Gold et al, 2024**: <https://www.nature.com/articles/s41467-023-44300-0>
+
+```{r setup, include=FALSE}
+library(knitr)
+# Global chunk options for all plots
+knitr::opts_chunk$set(
+  fig.width = 10,        # Set the width of the figures (in inches)
+  fig.height = 10,       # Set the height of the figures (in inches)
+  out.width = "100%",    # Make the figure occupy 100% of the page width
+  dpi = 300,             # Set the resolution to 300 DPI for high-quality output
+  echo = FALSE, 
+  message = FALSE,       # Suppress messages
+  warning = FALSE,       # Suppress warnings
+  cache = TRUE,
+  fig.retina = 2         # Set high DPI support for HTML (Retina displays)
+)
+```
+
+Libraries
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+library(Seurat)
+library(SuperCell)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(tibble)
+library(harmony)
+library(presto)
+library(pheatmap)
+library(RColorBrewer)
+library(rmarkdown)
+library(stats)
+library(scales)
+library(Matrix)
+library(purrr)
+library(igraph)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(rlang)
+library(uwot)
+# library(biomaRt)
+library(data.table)
+library(readxl)
+library(SeuratWrappers)
+library(stringr)
+```
+
+The purpose of this project is twofold:
+
+1)  to collate all available scRNA-seq and snRNA-seq data that exists for medulloblastoma mediated by the Sonic Hedgehog cell signaling pathway for characterization of cell types and marker gene expression.
+
+2)  to determine how metacell representation of single cell data can be preserved and optimized to categorize cell types.
+
+# Part 1
+
+```{r, warning = FALSE, message = FALSE, cache = FALSE}
+
+# Folder to save images in Part 1
+img_dir1_Gold <- "/home/gak190001/downloads/SHH_Medulloblastoma_Atlas_Project/Gold_Images/Part_1_Images"
+
+if (!dir.exists(img_dir1_Gold)) dir.create(img_dir1_Gold)
+```
+
+### Step 1: Import data
+
+```{r, message = FALSE, warning = FALSE, cache=TRUE, cache.lazy=FALSE}
+
+FOLDER_Gold  <- "/home/gak190001/downloads/GSE214469_nuclei/"
+PROJECT_Gold <- "GSE214469"
+SPECIES_Gold <- "human"
+ASSAY_Gold   <- "nuclei"
+
+get_sample_name_Gold <- function(filename) {
+  base  <- tools::file_path_sans_ext(basename(filename))
+  parts <- strsplit(base, "_")[[1]]
+  return(tail(parts, 1))
+}
+
+h5_files_Gold <- c(
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607000_filtered_feature_bc_matrix_mb0595.h5",
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607001_filtered_feature_bc_matrix_mb0601.h5",
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607002_filtered_feature_bc_matrix_mb2112.h5",
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607003_filtered_feature_bc_matrix_mb3400.h5",
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607004_filtered_feature_bc_matrix_mb3612.h5",
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607005_filtered_feature_bc_matrix_mb3201.h5",
+  "/home/gak190001/downloads/GSE214469_nuclei/GSM6607006_filtered_feature_bc_matrix_mb4113.h5"
+)
+
+qc_sample_Gold <- function(h5_path) {
+  samp <- get_sample_name_Gold(h5_path)
+  cat("Reading:", samp, "\n")
+  counts <- Read10X_h5(h5_path, use.names = TRUE, unique.features = TRUE)
+  obj <- CreateSeuratObject(counts,
+                             assay        = "RNA",
+                             min.cells    = 5,
+                             min.features = 300,
+                             project      = PROJECT_Gold)
+  obj <- AddMetaData(obj, samp,                                  col.name = "sample_Gold")
+  obj <- AddMetaData(obj, ASSAY_Gold,                            col.name = "assay")
+  obj <- AddMetaData(obj, SPECIES_Gold,                          col.name = "species")
+  obj <- AddMetaData(obj, paste0(PROJECT_Gold, "-", ASSAY_Gold), col.name = "project")
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  scrub_path <- paste0("/home/gak190001/downloads/scrublet_files/", samp, ".csv")
+  scrub      <- read.csv(scrub_path, row.names = 1)
+  obj        <- AddMetaData(obj, scrub)
+  cq5  <- quantile(obj@meta.data$nCount_RNA,   0.05)
+  cq95 <- quantile(obj@meta.data$nCount_RNA,   0.95)
+  fq5  <- quantile(obj@meta.data$nFeature_RNA, 0.05)
+  fq95 <- quantile(obj@meta.data$nFeature_RNA, 0.95)
+  obj <- subset(obj,
+                subset = nCount_RNA   >= cq5  &
+                         nCount_RNA   <= cq95 &
+                         nFeature_RNA >= fq5  &
+                         nFeature_RNA <= fq95 &
+                         percent.mt   <  5    &
+                         Call90       == "Good")
+  cat("  Cells after QC:", ncol(obj), "\n")
+  return(obj)
+}
+
+Gold_list   <- lapply(h5_files_Gold, qc_sample_Gold)
+names(Gold_list) <- sapply(h5_files_Gold, get_sample_name_Gold)
+
+Gold_merged <- merge(Gold_list[[1]],
+                     y            = Gold_list[-1],
+                     add.cell.ids = names(Gold_list),
+                     project      = PROJECT_Gold)
+
+cat("Total cells after per-sample QC and merge:", ncol(Gold_merged), "\n")
+```
+
+### Step 2: Quality Control
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+# Feature scatter
+FS_plot1_Gold <- FeatureScatter(Gold_merged, feature1 = "nCount_RNA", feature2 = "percent.mt",   raster = FALSE)
+FS_plot2_Gold <- FeatureScatter(Gold_merged, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", raster = FALSE)
+
+combinedScatter<- FS_plot1_Gold + FS_plot2_Gold
+combinedScatter
+
+# Save Image
+ggsave(file.path(img_dir1_Gold, "combinedScatter_Gold.png"), plot = combinedScatter, width = 20, height = 8, bg = "white")
+```
+
+### Step 3: Data Normalization
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Gold_merged <- NormalizeData(Gold_merged,
+                              normalization.method = "LogNormalize",
+                              scale.factor         = 10000)
+cat("Normalization complete\n")
+```
+
+### Step 4: Feature Selection and Heterogeneity Analysis
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Gold_merged <- FindVariableFeatures(Gold_merged,
+                                     selection.method = "vst",
+                                     nfeatures        = 2500)
+
+top10_Gold <- head(VariableFeatures(Gold_merged), 10)
+cat("Top 10 variable features:", paste(top10_Gold, collapse = ", "), "\n")
+
+VF_plot1_Gold <- VariableFeaturePlot(Gold_merged)
+VF_plot2_Gold <- LabelPoints(plot   = VF_plot1_Gold,
+                              points = top10_Gold,
+                              repel  = TRUE)
+combinedVariableFeatures_All <- VF_plot1_Gold + VF_plot2_Gold
+combinedVariableFeatures_All
+
+# Save Image
+ggsave(file.path(img_dir1_Gold, "combinedVariableFeatures_Gold.png"), plot = combinedVariableFeatures_All, width = 12, height = 9, bg = "white")
+```
+
+### Step 5: Data Scaling
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Gold_merged <- ScaleData(Gold_merged,
+                          features        = VariableFeatures(Gold_merged),
+                          vars.to.regress = "nCount_RNA",
+                          verbose         = TRUE)
+cat("Scaling complete\n")
+```
+
+### Step 6: PCA
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Gold_merged <- RunPCA(Gold_merged,
+                      features = VariableFeatures(Gold_merged),
+                      verbose  = FALSE)
+
+cat("PCA complete\n")
+
+# --- Scree (Elbow) Plot ---
+PC_ElbowPlot_Gold <- ElbowPlot(Gold_merged, ndims = 50)
+
+ggsave(
+  file.path(img_dir1_Gold, "PC_ElbowPlot_Gold.png"),
+  plot  = PC_ElbowPlot_Gold,
+  width = 12,
+  height = 9,
+  bg    = "white"
+)
+
+# --- Heatmap (DimHeatmap) ---
+PCs_Heatmap_Gold_file <- file.path(img_dir1_Gold, "PCs_Heatmap_Riemondy.png")
+
+png(
+  filename = PCs_Heatmap_Gold_file,
+  width    = 2000,
+  height   = 5000,
+  res      = 150,
+  bg       = "white"
+)
+
+DimHeatmap(
+  Gold_merged,
+  dims     = 1:15,
+  cells    = 500,
+  balanced = TRUE
+)
+
+dev.off()
+
+# Top genes per PC
+print(Gold_merged[["pca"]], dims = 1:10, nfeatures = 5)
+```
+
+Step 7
+
+```{r}
+
+Gold_merged <- RunHarmony(Gold_merged, group.by.vars = "sample_Gold")
+cat("Harmony complete\n")
+
+# Authors explicitly use dims 1:50, resolution 0.25
+Gold_merged <- RunUMAP(Gold_merged,       reduction = "harmony", dims = 1:50)
+Gold_merged <- FindNeighbors(Gold_merged, reduction = "harmony", dims = 1:50)
+Gold_merged <- FindClusters(Gold_merged,  resolution = 0.25)
+
+cat("Clusters found:", length(unique(Idents(Gold_merged))), "\n")
+print(table(Idents(Gold_merged)))
+
+# ── Cell type annotation ─────────────────────────────────────
+annot_list_Gold <- list("8"  = "Fibroblast",
+                         "9"  = "Macrophage",
+                         "11" = "Astrocyte",
+                         "12" = "Oligodendrocyte",
+                         "14" = "Microglia",
+                         "6"  = "Immune-Other")
+
+Gold_idents <- as.character(Idents(Gold_merged))
+Gold_annots <- as.character(sapply(Gold_idents, function(x) {
+  if (x %in% names(annot_list_Gold)) annot_list_Gold[[x]] else "Tumor"
+}))
+Gold_merged <- AddMetaData(Gold_merged, Gold_annots, col.name = "CellType")
+
+# ── Publication colors ───────────────────────────────────────
+celltype_colors_Gold <- c("Astrocyte"       = "#009265",
+                           "Tumor"           = "#4EA8DA",
+                           "Fibroblast"      = "#DA692F",
+                           "Immune-Other"    = "#6D75B6",
+                           "Macrophage"      = "#EC2393",
+                           "Microglia"       = "#4CAD50",
+                           "Oligodendrocyte" = "#E9A52A")
+
+# ── UMAP by cluster ──────────────────────────────────────────
+UMAP_cluster_Gold <- DimPlot(Gold_merged,
+                              reduction = "umap",
+                              label     = TRUE,
+                              pt.size   = 0.5) +
+  scale_y_reverse() +
+  ggtitle("Clusters (res = 0.25, dims = 1:50)")
+UMAP_cluster_Gold
+
+# ── UMAP by cell type with publication colors ─────────────────
+UMAP_celltype_Gold <- DimPlot(Gold_merged,
+                               reduction = "umap",
+                               group.by  = "CellType",
+                               cols      = celltype_colors_Gold,
+                               label     = TRUE,
+                               pt.size   = 0.5) +
+  scale_y_reverse() +
+  ggtitle("Cell Type")
+UMAP_celltype_Gold
+```
+
+Sanity check
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Gold_merged <- JoinLayers(Gold_merged, assay = "RNA")
+Idents(Gold_merged) <- "CellType"
+
+markers_Gold <- FindAllMarkers(
+  Gold_merged,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25
+)
+
+top_markers_Gold <- markers_Gold %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 3) 
+top_genes_Gold <- unique(top_markers_Gold$gene)
+top_markers_Gold
+
+genes_by_celltype_Gold <- split(
+  top_markers_Gold$gene,
+  top_markers_Gold$cluster
+)
+
+genes_by_celltype_Gold
+```
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+
+features_to_plot_Gold <- c("LINC02147", "LINC00924", "SLC16A12" )
+
+feature_plots_Gold <- lapply(features_to_plot_Gold, function(gene) {
+  FeaturePlot(Gold_merged,
+              features  = gene,
+              reduction = "umap",
+              pt.size   = 0.5,
+              raster    = FALSE) +
+    scale_y_reverse() +
+    ggtitle(gene)
+})
+
+names(feature_plots_Gold) <- features_to_plot_Gold
+
+combined_featureplots_Gold <- wrap_plots(feature_plots_Gold, ncol = 3)
+
+# Display
+combined_featureplots_Gold
+```

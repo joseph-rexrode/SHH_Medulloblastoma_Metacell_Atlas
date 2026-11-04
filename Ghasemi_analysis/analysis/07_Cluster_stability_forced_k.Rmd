@@ -1,0 +1,503 @@
+---
+title: "07 — Cluster stability with forced k"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+library(Seurat)
+library(harmony)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+seed_value <- 20200204
+ndim       <- 20   # Harmony dims (same as 05)
+ndim_single <- 10  # PCA dims for single-sample clustering (same as 01)
+
+out_dir <- here("Ghasemi_analysis", "results", "cluster_stability_forced_k")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+## Overview
+
+Mirrors reference Aim 1.1 (n = 1) and Aim 1.2 (n = 2 ... 9).
+
+* **Reference clustering** = the 9-sample integrated clustering already saved by 05
+  (`9_cluster_results.rds`, res 0.175). It plays the role of the published annotation.
+* For every n < 9, samples are added cumulatively in order of malignant cell count.
+  The *resolution is tuned so the number of clusters equals the reference k*.
+* Heatmap: x = reference cluster, y = new cluster. Fill = relative fraction, i.e. the
+  fraction of each reference cluster's cells that land in each new cluster
+  (every column sums to 1). Tile text = cell counts.
+* Nothing here overwrites `combined.rds`. Each n is cached as its own small `.rds`
+  in `cluster_stability_forced_k/` (delete a file to force a rerun).
+
+## Helper functions
+
+```{r functions}
+
+# ---- level ordering: numeric if labels look numeric, otherwise alphabetical ----
+ord_levels <- function(x) {
+  u <- unique(as.character(x))
+  n <- suppressWarnings(as.numeric(u))
+  if (anyNA(n)) sort(u) else u[order(n)]
+}
+
+# ---- find the resolution that gives exactly `target_k` clusters ----
+# Runs one FindClusters call over a grid of resolutions (graph is built once),
+# counts clusters at each, and picks the middle of the resolutions that hit
+# target_k (more robust than the first hit). If none hit exactly, uses the
+# closest k and warns. FindNeighbors() must already have been run.
+find_resolution_for_k <- function(sobj, target_k,
+                                  res_grid = round(seq(0.02, 1.5, by = 0.01), 3),
+                                  seed = seed_value) {
+
+  # drop old *_snn_res.* columns so only the new grid is counted
+  md <- sobj@meta.data
+  sobj@meta.data <- md[, !grepl("_snn_res\\.", colnames(md)), drop = FALSE]
+
+  sobj <- FindClusters(sobj, resolution = res_grid,
+                       random.seed = seed, verbose = FALSE)
+
+  cols <- grep("_snn_res\\.", colnames(sobj@meta.data), value = TRUE)
+  res  <- as.numeric(sub(".*_res\\.", "", cols))
+  ks   <- vapply(cols, function(cl) length(unique(sobj[[cl]][, 1])), integer(1))
+
+  hit <- res[ks == target_k]
+  if (length(hit) > 0) {
+    best <- hit[which.min(abs(hit - median(hit)))]
+  } else {
+    best <- res[which.min(abs(ks - target_k))]
+    warning("No resolution gave exactly k = ", target_k,
+            "; using res = ", best, " (k = ", ks[res == best][1], ")")
+  }
+
+  best_col <- cols[which(res == best)[1]]
+  labels <- as.character(sobj[[best_col]][, 1])
+  names(labels) <- colnames(sobj)
+
+  list(resolution = best, k = length(unique(labels)), clusters = labels)
+}
+
+# ---- package a fitted object into a small, savable list ----
+finish_fit <- function(sobj, fit, reduction_umap = "umap") {
+  um <- as.data.frame(Embeddings(sobj, reduction_umap))
+  colnames(um) <- c("UMAP_1", "UMAP_2")
+  um$cell <- rownames(um)
+
+  list(
+    assign = data.frame(
+      cell    = colnames(sobj),
+      sample  = as.character(sobj$sample),
+      cluster = fit$clusters[colnames(sobj)],
+      stringsAsFactors = FALSE
+    ),
+    umap = um,
+    resolution = fit$resolution,
+    k = fit$k
+  )
+}
+
+# ---- n >= 2: same steps as runIntegration() in 05, but no file saving and forced k ----
+integrate_subset <- function(base, samples, target_k,
+                             ndim = 20, theta = 2, seed = seed_value) {
+
+  sobj <- subset(base, subset = sample %in% samples)
+
+  sobj <- NormalizeData(sobj, normalization.method = "LogNormalize",
+                        scale.factor = 10000, verbose = FALSE)
+  sobj <- FindVariableFeatures(sobj, selection.method = "vst",
+                               nfeatures = 3000, verbose = FALSE)
+  sobj <- ScaleData(sobj, vars.to.regress = c("nCount_RNA", "percent.mt"),
+                    verbose = FALSE)
+  sobj <- RunPCA(sobj, features = VariableFeatures(sobj), verbose = FALSE)
+
+  set.seed(seed)
+  sobj <- RunHarmony(sobj, group.by.vars = "sample", theta = theta)
+
+  sobj <- FindNeighbors(sobj, reduction = "harmony", dims = 1:ndim,
+                        verbose = FALSE)
+  fit  <- find_resolution_for_k(sobj, target_k, seed = seed)
+
+  sobj <- RunUMAP(sobj, reduction = "harmony", dims = 1:ndim,
+                  seed.use = seed, verbose = FALSE)
+
+  finish_fit(sobj, fit)
+}
+
+# ---- n = 1: cluster one sample on its own (malignant cells only), forced k ----
+# Analogue of reference Aim 1.1, which re-ran the pipeline per patient on the
+# subset of cells that had annotations.
+single_sample_fit <- function(sid, ref_assign, target_k,
+                              ndim_single = 10, seed = seed_value) {
+
+  f <- list.files(here("Ghasemi_analysis", "results", "sample_results"),
+                  pattern = "_object_with_SingleR\\.rds$",
+                  recursive = TRUE, full.names = TRUE)
+  f <- f[startsWith(basename(f), paste0(sid, "_"))]
+  stopifnot("expected exactly one per-sample object" = length(f) == 1)
+
+  obj   <- readRDS(f)
+  ref_s <- ref_assign[ref_assign$sample == sid, ]
+
+  # Match cells by name after stripping a trailing "_<digits>" suffix (e.g. the
+  # "_1" that merge() appended in 05: MBEN_AK1_c3_1 -> MBEN_AK1_c3). Per-sample
+  # names end in "_c<digits>", so they are left unchanged. Matching is within a
+  # single sample, so there is no cross-sample collision risk.
+  core_bc <- function(x) sub("_[0-9]+$", "", x)
+  obj_key <- core_bc(colnames(obj))
+  ref_key <- core_bc(ref_s$cell)
+  dup_examples <- function(k, nm) {
+    d <- k %in% k[duplicated(k)]
+    if (any(d)) paste(head(nm[d], 8), collapse = ", ") else "none"
+  }
+  d_obj <- dup_examples(obj_key, colnames(obj))
+  d_ref <- dup_examples(ref_key, ref_s$cell)
+  if (d_obj != "none" || d_ref != "none") {
+    stop(sid, ": duplicate names after stripping the suffix.",
+         "\n  per-sample object: ", d_obj,
+         "\n  reference:         ", d_ref)
+  }
+
+  keep <- obj_key %in% ref_key
+  message(sid, ": ", sum(keep), " of ", nrow(ref_s),
+          " reference cells found in per-sample object")
+  if (sum(keep) == 0) {
+    stop(sid, ": no barcode overlap.\n  per-sample: ",
+         paste(head(colnames(obj), 3), collapse = ", "),
+         "\n  reference:  ", paste(head(ref_s$cell, 3), collapse = ", "))
+  }
+  if (sum(keep) < 0.9 * nrow(ref_s)) {
+    warning(sid, ": fewer than 90% of reference cells were found.")
+  }
+
+  obj <- subset(obj, cells = colnames(obj)[keep])
+  # rename to the reference's cell names so later joins by cell name work
+  obj <- RenameCells(obj, new.names = ref_s$cell[match(core_bc(colnames(obj)), ref_key)])
+  obj$sample <- sid
+  DefaultAssay(obj) <- "RNA"
+
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, selection.method = "vst",
+                              nfeatures = 3000, verbose = FALSE)
+  obj <- ScaleData(obj, verbose = FALSE)
+
+  npcs <- min(30, ncol(obj) - 1)
+  obj  <- RunPCA(obj, features = VariableFeatures(obj), npcs = npcs,
+                 verbose = FALSE)
+  dims <- 1:min(ndim_single, npcs)
+
+  obj <- FindNeighbors(obj, reduction = "pca", dims = dims, verbose = FALSE)
+  fit <- find_resolution_for_k(obj, target_k, seed = seed)
+  obj <- RunUMAP(obj, reduction = "pca", dims = dims,
+                 seed.use = seed, verbose = FALSE)
+
+  finish_fit(obj, fit)
+}
+
+# ---- overlap table: rows = new clusters, cols = reference clusters ----
+# frac is normalised per reference cluster (columns sum to 1).
+# Rows are ordered by best-matching reference cluster, so a stable clustering
+# shows up as a diagonal. (Cluster numbers are arbitrary between runs.)
+overlap_table <- function(ref_cluster, new_cluster) {
+  tab <- table(
+    new = factor(as.character(new_cluster), levels = ord_levels(new_cluster)),
+    ref = factor(as.character(ref_cluster), levels = ord_levels(ref_cluster))
+  )
+  m    <- unclass(tab)
+  frac <- sweep(m, 2, pmax(colSums(m), 1), "/")
+
+  best_ref <- apply(frac, 1, which.max)
+  best_val <- apply(frac, 1, max)
+  ord <- order(best_ref, -best_val)
+
+  list(counts = m[ord, , drop = FALSE], frac = frac[ord, , drop = FALSE])
+}
+
+overlap_heatmap <- function(ref_cluster, new_cluster, xlab, ylab) {
+  ot <- overlap_table(ref_cluster, new_cluster)
+
+  if (nrow(ot$counts) == 0 || ncol(ot$counts) == 0) {
+    stop("Empty overlap table: no cells to compare.")
+  }
+
+  # long format, built by hand (column-major, same order as as.vector())
+  df <- data.frame(
+    new   = rep(rownames(ot$counts), times = ncol(ot$counts)),
+    ref   = rep(colnames(ot$counts), each  = nrow(ot$counts)),
+    count = as.vector(ot$counts),
+    frac  = as.vector(ot$frac),
+    stringsAsFactors = FALSE
+  )
+  df$ref  <- factor(df$ref, levels = colnames(ot$counts))
+  df$new  <- factor(df$new, levels = rev(rownames(ot$counts)))  # first row on top
+
+  ggplot(df, aes(x = ref, y = new, fill = frac)) +
+    geom_tile(width = 0.9, height = 0.9) +
+    geom_text(aes(label = count, color = frac > 0.5),
+              fontface = "bold", size = 5, show.legend = FALSE) +
+    scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black")) +
+    scale_fill_gradient(
+      low = "white", high = "forestgreen", limits = c(0, 1),
+      name = "Relative fraction\n(of reference cluster)",
+      guide = guide_colorbar(title.position = "top", title.hjust = 0.5)
+    ) +
+    labs(x = xlab, y = ylab) +
+    theme_minimal(base_size = 14) +
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y = element_text(face = "bold"),
+          legend.position = "right") +
+    coord_fixed(ratio = 1)
+}
+
+umap_panel <- function(fit) {
+  df <- merge(fit$umap, fit$assign[, c("cell", "cluster")], by = "cell")
+  df$cluster <- factor(df$cluster, levels = ord_levels(df$cluster))
+  cent <- aggregate(cbind(UMAP_1, UMAP_2) ~ cluster, data = df, FUN = median)
+
+  ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = cluster)) +
+    geom_point(size = 0.4) +
+    geom_text(data = cent, aes(x = UMAP_1, y = UMAP_2, label = cluster),
+              inherit.aes = FALSE, color = "black", fontface = "bold", size = 5) +
+    theme_classic(base_size = 14) +
+    theme(legend.position = "none") +
+    coord_fixed()
+}
+
+make_panel <- function(fit, title, ref_assign, xlab, ylab) {
+  a <- fit$assign
+  r <- ref_assign$cluster[match(a$cell, ref_assign$cell)]
+  keep <- !is.na(r)
+
+  if (sum(keep) == 0) {
+    stop("None of this fit's cells match the reference cell names.\n  fit:       ",
+         paste(head(a$cell, 3), collapse = ", "),
+         "\n  reference: ", paste(head(ref_assign$cell, 3), collapse = ", "),
+         "\n  If these differ, the fit was probably cached from an earlier run. ",
+         "Delete the .rds files in cluster_stability_forced_k/ and rerun.")
+  }
+  message(title, ": ", sum(keep), " of ", nrow(a), " cells matched the reference")
+
+  p_h <- overlap_heatmap(r[keep], a$cluster[keep], xlab, ylab)
+  p_u <- umap_panel(fit)
+
+  (p_u | p_h) +
+    plot_annotation(
+      title = title,
+      theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+    )
+}
+
+# ---- Adjusted Rand Index (no extra dependency) ----
+ari <- function(a, b) {
+  tab <- table(a, b)
+  c2  <- function(x) x * (x - 1) / 2
+  sum_ij <- sum(c2(tab))
+  sum_a  <- sum(c2(rowSums(tab)))
+  sum_b  <- sum(c2(colSums(tab)))
+  expected <- sum_a * sum_b / c2(sum(tab))
+  (sum_ij - expected) / (0.5 * (sum_a + sum_b) - expected)
+}
+
+summarise_fit <- function(fit, label, ref_assign) {
+  a <- fit$assign
+  r <- ref_assign$cluster[match(a$cell, ref_assign$cell)]
+  ot <- overlap_table(r, a$cluster)
+  present <- colSums(ot$counts) > 0
+
+  data.frame(
+    comparison = label,
+    n_cells = nrow(a),
+    resolution = fit$resolution,
+    k_achieved = fit$k,
+    ARI = ari(r, a$cluster),
+    # mean over reference clusters of the largest fraction that lands in one new cluster
+    mean_best_match = mean(apply(ot$frac[, present, drop = FALSE], 2, max))
+  )
+}
+
+```
+
+## Reference clustering and sample order
+
+```{r reference}
+
+ref <- readRDS(here("Ghasemi_analysis", "results", "cluster_stability",
+                    "9_cluster_results.rds"))
+ref_assign <- ref$cell_assignments
+ref_assign$cluster <- as.character(ref_assign$cluster)
+ref_assign$sample  <- as.character(ref_assign$sample)
+
+k_ref <- length(unique(ref_assign$cluster))
+message("Reference k = ", k_ref)
+table(ref_assign$cluster)
+
+# base object: malignant cells, before any re-integration (saved by 05)
+base <- readRDS(here("Ghasemi_analysis", "results", "combined",
+                     "malignant_base_before_reintegration.rds"))
+
+# order samples by malignant cell count, largest first (as in the reference)
+cell_counts  <- sort(table(as.character(base$sample)), decreasing = TRUE)
+sample_order <- names(cell_counts)
+print(cell_counts)
+
+# compare with the order hard-coded in 05
+old_order <- c("AK1", "MB295", "MB299", "MB287", "AK3", "MB266", "MB263", "MB88", "AK2")
+if (!identical(sample_order, old_order)) {
+  message("NOTE: cell-count order differs from the order hard-coded in 05:\n  new: ",
+          paste(sample_order, collapse = ", "), "\n  old: ",
+          paste(old_order, collapse = ", "))
+}
+
+```
+
+## Cumulative integrations, n = 8 ... 2 (forced k)
+
+The 9-sample result is reused as the reference and is not rerun.
+
+```{r cumulative}
+
+fits <- list()
+
+for (n in 8:2) {
+
+  res_file <- file.path(out_dir, paste0(n, "_forced_k_results.rds"))
+
+  if (file.exists(res_file)) {
+    message("n = ", n, ": loading cached result")
+    fits[[as.character(n)]] <- readRDS(res_file)
+    next
+  }
+
+  message("n = ", n, ": integrating ", paste(sample_order[1:n], collapse = ", "))
+  fit <- integrate_subset(base, sample_order[1:n], target_k = k_ref, ndim = ndim)
+  fit$n <- n
+  fit$samples <- sample_order[1:n]
+
+  saveRDS(fit, res_file)
+  fits[[as.character(n)]] <- fit
+}
+
+```
+
+## Single samples, n = 1 (forced k)
+
+Each sample is re-clustered on its own malignant cells with k forced to the
+reference k. Note that a single sample may not contain every reference cluster,
+so forcing k can over-split it.
+
+```{r single}
+
+single_fits <- list()
+
+for (sid in sample_order) {
+
+  res_file <- file.path(out_dir, paste0("single_", sid, "_forced_k_results.rds"))
+
+  if (file.exists(res_file)) {
+    single_fits[[sid]] <- readRDS(res_file)
+    next
+  }
+
+  message("Single sample: ", sid)
+  fit <- single_sample_fit(sid, ref_assign, target_k = k_ref,
+                           ndim_single = ndim_single)
+  saveRDS(fit, res_file)
+  single_fits[[sid]] <- fit
+}
+
+```
+
+## Heatmaps
+
+```{r heatmaps, fig.width=20, fig.height=9}
+
+xlab <- "Reference cluster (9-sample integration)"
+
+# cumulative n = 8 ... 2
+for (n in 8:2) {
+  fit <- fits[[as.character(n)]]
+
+  p <- make_panel(
+    fit,
+    title = paste0("Top ", n, " samples: ", paste(sample_order[1:n], collapse = ", "),
+                   "   (res = ", fit$resolution, ", k = ", fit$k, ")"),
+    ref_assign = ref_assign,
+    xlab = xlab,
+    ylab = paste0("Cluster in ", n, "-sample integration")
+  )
+
+  ggsave(file.path(out_dir, paste0("overlap_9v", n, "_forced_k.png")),
+         plot = p, width = 20, height = 9, bg = "white")
+  print(p)
+}
+
+# single samples
+for (sid in names(single_fits)) {
+  fit <- single_fits[[sid]]
+
+  p <- make_panel(
+    fit,
+    title = paste0("Sample ", sid, " alone",
+                   "   (res = ", fit$resolution, ", k = ", fit$k, ")"),
+    ref_assign = ref_assign,
+    xlab = xlab,
+    ylab = paste0("Cluster in ", sid, " alone")
+  )
+
+  ggsave(file.path(out_dir, paste0("overlap_9v_single_", sid, "_forced_k.png")),
+         plot = p, width = 20, height = 9, bg = "white")
+  print(p)
+}
+
+```
+
+## Summary metrics
+
+ARI compares the whole partition to the reference (1 = identical, ~0 = chance).
+`mean_best_match` is the average, over reference clusters, of the largest
+relative fraction that ends up in a single new cluster (1 = every reference
+cluster stays intact). Single-sample rows are computed within that sample's
+cells only, so compare them with each other rather than with the cumulative rows.
+
+```{r summary}
+
+summary_cumulative <- bind_rows(lapply(names(fits), function(n) {
+  summarise_fit(fits[[n]], paste0("top", n), ref_assign)
+}))
+summary_cumulative$n_samples <- as.numeric(sub("top", "", summary_cumulative$comparison))
+summary_cumulative <- summary_cumulative[order(summary_cumulative$n_samples), ]
+
+summary_single <- bind_rows(lapply(names(single_fits), function(sid) {
+  summarise_fit(single_fits[[sid]], paste0("single_", sid), ref_assign)
+}))
+
+summary_all <- bind_rows(summary_single, summary_cumulative[, names(summary_single)])
+write.csv(summary_all, file.path(out_dir, "stability_summary.csv"), row.names = FALSE)
+summary_all
+
+p_sum <- ggplot(summary_cumulative, aes(x = n_samples)) +
+  geom_line(aes(y = ARI, color = "ARI")) +
+  geom_point(aes(y = ARI, color = "ARI"), size = 3) +
+  geom_line(aes(y = mean_best_match, color = "Mean best-match fraction")) +
+  geom_point(aes(y = mean_best_match, color = "Mean best-match fraction"), size = 3) +
+  scale_x_continuous(breaks = 2:8) +
+  ylim(0, 1) +
+  labs(x = "Number of samples integrated", y = "Agreement with 9-sample reference",
+       color = NULL, title = "Cluster stability vs number of samples (forced k)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(file.path(out_dir, "stability_summary.png"), plot = p_sum,
+       width = 9, height = 6, bg = "white")
+p_sum
+
+```

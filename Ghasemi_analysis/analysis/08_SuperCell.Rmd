@@ -1,0 +1,606 @@
+---
+title: "08 — SuperCell"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+library(here)
+library(SuperCell)
+library(mclust)
+library(grid)
+library(pheatmap)
+library(dplyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+```
+
+## Import Object
+
+```{r}
+
+o <- readRDS(file.path(here(), 
+                  "Ghasemi_analysis", 
+                  "results", 
+                  "combined",
+                  "malignant_base_before_reintegration.rds"))
+
+```
+
+
+```{r}
+
+sc_list <- list()
+membership_list <- list()
+
+for (s in unique(o$sample)) {
+  obj <- subset(x = o, subset = o$sample == s)
+  sample_id <- s
+  norm <- GetAssayData(obj, assay = "RNA", layer = "data")
+  raw  <- GetAssayData(obj, assay = "RNA", layer = "counts")
+
+  scell <- SCimplify(norm, 
+                     k.knn = 5, 
+                     gamma = 10, 
+                     n.var.genes = 2000,
+                     n.pc = 10,
+                     return_membership = TRUE, 
+                     verbose = FALSE)
+  
+  membership_list[[s]] <- scell$membership
+  
+  # Sum RAW counts
+  SC.counts <- supercell_GE(raw, groups = scell$membership, mode = "sum")
+
+  # supercell_GE returns columns in order 1..N supercells
+  sc_ids <- seq_len(ncol(SC.counts))
+  colnames(SC.counts) <- paste0(sample_id, "_SC", sc_ids)
+
+  # Majority cell type + size per supercell
+  meta <- data.frame(ct = obj$cell_type[names(scell$membership)],
+                   sc = scell$membership) |>
+  dplyr::group_by(sc) |>
+  dplyr::summarize(
+    cell_type = names(which.max(table(ct))),
+    sc_size   = dplyr::n(),
+    purity    = max(table(ct)) / dplyr::n()
+  ) |>
+  as.data.frame()
+  rownames(meta) <- paste0(sample_id, "_SC", meta$sc)
+  meta$pt_id <- sample_id
+  meta$dataset <- "Ghasemi"
+
+  so <- CreateSeuratObject(counts = SC.counts, meta.data = meta[colnames(SC.counts), ])
+  sc_list[[sample_id]] <- so
+  saveRDS(so, file.path(mainDir, paste0(sample_id, "_res"), paste0(sample_id, "_scObject.rds")),
+          compress = "xz")
+  
+}
+
+merged <- merge(sc_list[[1]], sc_list[-1])
+merged <- NormalizeData(merged) |> FindVariableFeatures() |> ScaleData() |> RunPCA()
+merged <- RunHarmony(
+  merged,
+  group.by.vars = "pt_id",
+  theta = 2
+)
+
+ndim <- 20
+  
+merged <- FindNeighbors(
+    merged,
+    reduction = "harmony",
+    dims = 1:ndim
+)
+  
+merged <- FindClusters(
+    merged,
+    resolution = 0.26,
+    random.seed = 20200204
+)
+  
+merged <- RunUMAP(
+    merged,
+    reduction = "harmony",
+    dims = 1:ndim,
+    seed.use = 20200204
+  )
+
+# 1. Extract the current embeddings matrix
+mat <- Embeddings(merged, reduction = "umap")
+
+# 2. Flip the first column (X-axis)
+mat[, 2] <- -1 * mat[, 2]
+mat[, 1] <- -1 * mat[, 1]
+
+merged[["umap"]] <- CreateDimReducObject(
+  embeddings = mat, 
+  key = "UMAP_", 
+  assay = DefaultAssay(merged)
+)
+
+merged@tools$PlotData <- NULL
+
+# 5. Re-plot
+DimPlot(merged, reduction = "umap")
+
+
+
+combinedDimPlot <- DimPlot(
+    merged,
+    reduction = "umap",
+    group.by = "seurat_clusters"
+  ) +
+  labs(title = "Ghasemi: All Patients - SC + Harmony") +
+  guides(color = guide_legend(ncol = 1, override.aes = list(size = 5)))
+  
+ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "sc_combined_Dim_Plot.png"),
+       plot = combinedDimPlot,
+       width = 12,
+       height = 10,
+       bg = "white")
+
+```
+
+## Visualization
+
+```{r}
+
+without_supercell <- readRDS(file.path(here(), 
+                                       "Ghasemi_analysis",
+                                       "results",
+                                       "combined",
+                                       "combined.rds"))
+
+
+p1 <- DimPlot(
+    without_supercell,
+    reduction = "umap",
+    group.by = "RNA_snn_res.0.225"
+  ) +
+  labs(title = "Ghasemi: All Patients - Harmony") +
+  guides(color = guide_legend(ncol = 1, override.aes = list(size = 5)))
+
+sideBySide <- p1 | combinedDimPlot
+
+sideBySide
+
+ggsave(file.path(here(), "Ghasemi_analysis", "results", 
+                 "combined", "Ghasemi_Harmony_and_SCHarmony.png"),
+       plot = sideBySide,
+       width = 16,
+       height = 8,
+       bg = "white")
+
+# f1 <- FeaturePlot(
+#   object = without_supercell,
+#   features = c("BARHL1", "ZIC1", "ZIC3", "PTPRK")
+# )
+# 
+# f2 <- FeaturePlot(
+#   object = without_supercell,
+#   features = c("PTCH1", "SMO", "HHIP", "GLI1", "GLI2")
+# )
+# 
+# f3 <- FeaturePlot(
+#   object = without_supercell,
+#   features = c("GRIN2B", "CNTN2", "ASTN1", "SEMA6A")
+# )
+# 
+# f4 <- FeaturePlot(
+#   object = without_supercell,
+#   features = c("GABRA1", "GABRA6", "GRIN2C")
+# )
+# 
+# f5 <- FeaturePlot(
+#   object = without_supercell,
+#   features = c("LAMA2", "SOX2", "SOX9", "BOC")
+# )
+
+```
+
+```{r}
+
+## CELL -> SUPERCELL LOOKUP
+
+# Cell -> supercell table from membership_list
+membership_df <- purrr::imap_dfr(membership_list, function(m, s) {
+  data.frame(
+    cell   = names(m),
+    sample = s,
+    sc_id  = paste0(s, "_SC", as.integer(m))   # matches colnames(merged)
+  )
+})
+
+# Sanity check: do the barcodes match the object on the left plot?
+mean(membership_df$cell %in% colnames(without_supercell))
+mean(colnames(without_supercell) %in% membership_df$cell)
+
+## ADD SUPERCELL INFO
+
+without_supercell$sc_id <- membership_df$sc_id[
+  match(colnames(without_supercell), membership_df$cell)
+]
+
+# Pull supercell-level info from the merged SC object
+sc_meta <- merged@meta.data[, c("RNA_snn_res.0.26", "sc_size", "purity", "pt_id")]
+
+without_supercell$sc_cluster <- sc_meta[without_supercell$sc_id, "RNA_snn_res.0.26"]
+without_supercell$sc_size    <- sc_meta[without_supercell$sc_id, "sc_size"]
+without_supercell$sc_purity  <- sc_meta[without_supercell$sc_id, "purity"]
+
+# How do original clusters map to SC clusters?
+contingency_matrix <- table(original = without_supercell$RNA_snn_res.0.225,
+      sc_cluster = without_supercell$sc_cluster, useNA = "ifany")
+
+prob_matrix <- prop.table(contingency_matrix, margin = 1) * 100
+
+col_order <- c("0", "2", "3", "1", "4", "5")
+prob_matrix <- prob_matrix[, col_order]
+
+Heatmap(
+  matrix = prob_matrix,
+  name = "Matching %",
+  col = colorRamp2(c(0, 100), c("#A690A4", "#5E4B56")),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_title = "Cell Cluster Identity",
+  column_title = "SuperCell Cluster Identity",
+  rect_gp = gpar(col = "gray", width = 2),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+          # grid.text places the text exactly inside each cell
+          grid.text(paste0(sprintf("%.1f", prob_matrix[i, j]), "%"), x, y, 
+                    gp = gpar(fontsize = 16, col = "white"))}
+)
+
+
+## PLOT SUPERCELL ASSIGNMENTS ONTO SINGLE CELL EMBEDDING
+
+# Original cells colored by the cluster their supercell received
+p_sc_cluster <- DimPlot(without_supercell, reduction = "umap",
+                        group.by = "sc_cluster", raster = FALSE) +
+  labs(title = "Original cells colored by SC-cluster")
+
+# Supercell size and purity per cell
+p_size   <- FeaturePlot(without_supercell, "sc_size",   reduction = "umap", raster = FALSE)
+p_purity <- FeaturePlot(without_supercell, "sc_purity", reduction = "umap", raster = FALSE)
+
+all3 <- p_sc_cluster | p_size | p_purity
+
+normalvsuper <- p_sc_cluster | p1
+
+ggsave(file.path(here(), "Ghasemi_analysis", "results", "combined", "superimposition_SC_Normal_withSize_and_Purity.png"),
+       plot = all3,
+       width = 24,
+       height = 10,
+       bg = "white")
+
+ggsave(file.path(here(), "Ghasemi_analysis", "results", "combined", "superimposition_SC_NormalComparison.png"),
+       plot = normalvsuper,
+       width = 16,
+       height = 10,
+       bg = "white")
+
+## SHOW SUPERCELL CENTROIDS
+
+emb <- as.data.frame(Embeddings(without_supercell, "umap"))
+colnames(emb) <- c("UMAP_1", "UMAP_2")
+emb$sc_id <- without_supercell$sc_id
+emb$sample <- without_supercell$sample
+
+centroids <- emb |>
+  dplyr::filter(!is.na(sc_id)) |>
+  dplyr::group_by(sc_id) |>
+  dplyr::summarize(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    n      = dplyr::n(),
+    sample = dplyr::first(sample),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(sc_cluster = sc_meta[sc_id, "RNA_snn_res.0.26"])
+
+ggplot() +
+  geom_point(data = emb, aes(UMAP_1, UMAP_2), color = "grey85", size = 0.2) +
+  geom_point(data = centroids, aes(UMAP_1, UMAP_2, size = n, color = sc_cluster),
+             alpha = 0.8) +
+  scale_size_continuous(range = c(0.5, 6)) +
+  theme_classic() +
+  labs(title = "SuperCell centroids on original UMAP")
+
+## IS GAP PATIENT SPECIFIC?
+
+DimPlot(without_supercell, reduction = "umap", group.by = "RNA_snn_res.0.225",
+        split.by = "sample", ncol = 4, raster = FALSE)
+
+```
+
+
+## Program Score Concordance (SuperCell v. mean # of member cells)
+
+```{r}
+
+# program specific genes as listed in paper
+programs <- list(
+  EGL_CGNP    = c("BARHL1", "ZIC1", "ZIC3", "PTPRK"),
+  SHH         = c("PTCH1", "SMO", "HHIP", "GLI1", "GLI2"),
+  Migrating   = c("GRIN2B", "CNTN2", "ASTN1", "SEMA6A"),
+  Postmitotic = c("GABRA1", "GABRA6", "GRIN2C"),
+  Astro_like  = c("LAMA2", "SOX2", "SOX9", "BOC")
+)
+
+cols <- paste0("prog", seq_along(programs))
+
+score_cor <- list()
+
+for (s in names(sc_list)) {
+  obj <- subset(o, subset = sample == s)      # single cells, this sample
+  sc  <- NormalizeData(sc_list[[s]])          # supercells, this sample
+  mem <- membership_list[[s]]
+
+  # find union of listed programs and all genes in object
+  progs <- lapply(programs, intersect, rownames(obj)) 
+  
+  # calculate module score for single cells and for supercells
+  obj <- AddModuleScore(obj, features = progs, name = "prog")
+  sc  <- AddModuleScore(sc,  features = progs, name = "prog")
+
+  # mean single-cell score per supercell
+  cell_sc <- paste0(s, "_SC", mem)
+  member_means <- aggregate(obj@meta.data[names(mem), cols],
+                            by = list(sc = cell_sc), FUN = mean)
+  member_means <- member_means[match(colnames(sc), member_means$sc), ]
+
+  score_cor[[s]] <- sapply(cols, function(cl)
+    cor(sc[[cl]][, 1], member_means[[cl]], use = "complete.obs"))
+}
+
+score_cor_df <- do.call(rbind, score_cor)
+colnames(score_cor_df) <- names(programs)
+score_cor_df
+
+# Heat map to visualize correlation
+
+df_long <- score_cor_df %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "Sample") %>%
+  pivot_longer(
+    cols = -Sample, 
+    names_to = "Program", 
+    values_to = "Value"
+  )
+
+sc_ProgramScores <- ggplot(df_long, mapping = aes(x = Program, y = Sample, fill = Value)) +
+  geom_tile(color = "black") +
+  theme_minimal() +
+  scale_fill_gradient(
+    limits = c(0.5, 1) # Sets the exact range of the heatmap
+  ) +
+  geom_text(aes(label = round(Value, 2)), colour = "white", size = 4) +
+  labs(
+    title = "SuperCell Expression Retention",
+    x = "Program",
+    y = "Sample",
+    fill = "Correlation Score"
+  )
+  
+ggsave(file.path(here(), "Ghasemi_analysis", "results", "combined", "sc_ProgramScores.png"),
+       plot = sc_ProgramScores,
+       width = 6,
+       height = 6,
+       bg = "white")
+```
+
+## Averaged Heat Map by Cluster of Developmental Marker Genes
+
+```{r}
+
+
+# Marker genes from the paper, grouped by CGNP stage
+stage_genes <- list(
+  `Early CGNP (EGL)`   = c("BARHL1", "ZIC1", "ZIC3", "PTPRK"),
+  `SHH pathway`        = c("PTCH1", "SMO", "HHIP", "GLI1", "GLI2"),
+  `Proliferating/chromatin` = c("EZH2", "SUZ12", "CTCF", "YY1", "RAD21"),
+  `Migrating`          = c("GRIN2B", "CNTN2", "ASTN1", "SEMA6A"),
+  `Postmitotic`        = c("GABRA1", "GABRA6", "GRIN2C"),
+  `Astrocytic-like`    = c("LAMA2", "SOX2", "SOX9", "BOC")
+)
+
+objMarkers <- FindAllMarkers(without_supercell, 
+                             only.pos = FALSE, 
+                             min.pct = 0, 
+                             logfc.threshold = 0)
+
+merged <- JoinLayers(merged)          # collapse split layers into one counts and one data
+Idents(merged) <- "seurat_clusters"
+
+scMarkers <- FindAllMarkers(merged, 
+                            only.pos = FALSE, 
+                            min.pct = 0, 
+                            logfc.threshold = 0)
+
+pairs <- data.frame(single = c("0","1","2","3","4", "5"),
+                    super  = c("0","2","3","1","4", "5"))
+
+res <- lapply(seq_len(nrow(pairs)), function(i) {
+  a <- objMarkers[objMarkers$cluster == pairs$single[i], c("gene", "avg_log2FC", "pct.1")]
+  b <- scMarkers[scMarkers$cluster == pairs$super[i],  c("gene", "avg_log2FC")]
+  m <- merge(a, b, by = "gene", suffixes = c("_single", "_super"))
+
+  # all-gene rank correlation
+  rho_all <- cor(m$avg_log2FC_single, m$avg_log2FC_super, method = "spearman")
+
+  # correlation restricted to genes with a real positive effect in either object
+  strong <- m$avg_log2FC_single > 0.25 | m$avg_log2FC_super > 0.25
+  rho_strong <- cor(m$avg_log2FC_single[strong], m$avg_log2FC_super[strong],
+                    method = "spearman")
+
+  # overlap at several depths, filtering out lowly expressed genes in the single-cell list
+  a_f <- a[a$pct.1 > 0.25, ]
+  ov <- sapply(c(50, 100, 200, 500), function(n) {
+    top_single <- head(a_f$gene[order(-a_f$avg_log2FC)], n)
+    top_super  <- head(b$gene[order(-b$avg_log2FC)], n)
+    length(intersect(top_single, top_super)) / n
+  })
+  names(ov) <- paste0("top", c(50, 100, 200, 500))
+
+  data.frame(single = pairs$single[i], super = pairs$super[i],
+             n_genes = nrow(m), spearman_all = rho_all,
+             spearman_strong = rho_strong, t(ov))
+})
+do.call(rbind, res)
+
+###
+
+avg_heatmap <- function(obj, group_by, title = "") {
+  # keep only genes present, and remember which stage each belongs to
+  
+  gene_df <- data.frame(
+  gene  = as.character(unlist(stage_genes, use.names = FALSE)),
+  stage = rep(names(stage_genes), lengths(stage_genes))
+  )
+  
+  gene_df <- gene_df[gene_df$gene %in% rownames(obj), ]
+  gene_df <- gene_df[!duplicated(gene_df$gene), ]   # one row per gene
+
+  # average expression per cluster (data layer)
+  avg <- AverageExpression(
+    obj, features = gene_df$gene, group.by = group_by,
+    assays = "RNA", layer = "data", return.seurat = FALSE
+  )$RNA
+  avg <- log1p(as.matrix(avg))        # AverageExpression averages in non-log space
+
+  row_anno <- data.frame(Stage = gene_df$stage, row.names = gene_df$gene)
+
+  pheatmap(
+    avg[gene_df$gene, , drop = FALSE],
+    scale = "row",                    # row = z-score per gene so each gene is comparable
+    cluster_rows = FALSE,             # keep genes grouped by stage
+    cluster_cols = FALSE,              # or FALSE to keep cluster order
+    annotation_row = row_anno,
+    color = colorRampPalette(c("navy", "white", "firebrick"))(100),
+    border_color = NA,
+    main = title
+  )
+}
+
+avg_heatmap(without_supercell, "RNA_snn_res.0.225", "Single-cell clusters")
+avg_heatmap(merged, "RNA_snn_res.0.26", "Supercell clusters")
+
+```
+
+```{r}
+
+res2 <- lapply(seq_len(nrow(pairs)), function(i) {
+  a <- objMarkers[objMarkers$cluster == pairs$single[i], c("gene", "avg_log2FC", "pct.1")]
+  b <- scMarkers[scMarkers$cluster == pairs$super[i],  c("gene", "avg_log2FC", "pct.1")]
+  m <- merge(a, b, by = "gene", suffixes = c("_single", "_super"))
+
+  # same universe on both sides: expressed in both objects
+  m <- m[m$pct.1_single > 0.25 & m$pct.1_super > 0.25, ]
+  N <- nrow(m)
+  ns <- c(50, 100, 200, 500)
+
+  ov <- sapply(ns, function(n) {
+    length(intersect(m$gene[order(-m$avg_log2FC_single)][1:n],
+                     m$gene[order(-m$avg_log2FC_super)][1:n])) / n
+  })
+  fold_chance <- ov / (ns / N)        # 1 = random, higher = better
+
+  # soft check: percentile of single-cell top 100 within the supercell ranking
+  top_single <- m$gene[order(-m$avg_log2FC_single)][1:100]
+  pct_rank   <- rank(m$avg_log2FC_super) / N
+  mean_pctile <- mean(pct_rank[match(top_single, m$gene)])
+
+  data.frame(single = pairs$single[i], super = pairs$super[i], N_universe = N,
+             t(setNames(fold_chance, paste0("fold_chance_top", ns))),
+             mean_pctile_top100 = mean_pctile)
+})
+do.call(rbind, res2)
+
+```
+
+
+```{r}
+
+## HEATMAP FOR TOP 6 MARKERS 
+
+make_marker_heatmaps <- function(markers, marker_prefix = "C", n_per_cluster = 6,
+                                 source_label = "single-cell") {
+
+  # only genes present in both objects
+  shared <- intersect(rownames(without_supercell), rownames(merged))
+
+  top <- markers |>
+    filter(gene %in% shared, avg_log2FC > 0, pct.1 > 0.25) |>
+    group_by(cluster) |>
+    slice_max(avg_log2FC, n = n_per_cluster, with_ties = FALSE) |>
+    ungroup() |>
+    distinct(gene, .keep_all = TRUE) |>
+    arrange(as.numeric(as.character(cluster)), desc(avg_log2FC))
+
+  genes <- top$gene
+  row_group <- factor(paste0(marker_prefix, top$cluster, " markers"),
+                      levels = unique(paste0(marker_prefix, top$cluster, " markers")))
+
+  avg_z <- function(obj, group_by, prefix) {
+    a <- AverageExpression(obj, features = genes, group.by = group_by,
+                           assays = "RNA", layer = "data")$RNA
+    a <- log1p(as.matrix(a))
+    colnames(a) <- sub("^g", "", colnames(a))
+    a <- a[genes, order(as.numeric(colnames(a))), drop = FALSE]
+    z <- t(scale(t(a)))
+    colnames(z) <- paste0(prefix, colnames(z))
+    z
+  }
+
+  z1 <- avg_z(without_supercell, "RNA_snn_res.0.225", "C")
+  z2 <- avg_z(merged,            "seurat_clusters",   "S")
+
+  col_fun <- colorRamp2(c(-2, 0, 2), c("navy", "white", "firebrick"))
+
+  mk <- function(mat, title, first = FALSE) {
+    Heatmap(
+      mat, name = "Row z-score", col = col_fun,
+      cluster_rows = FALSE, cluster_columns = FALSE,
+      # marker blocks: split once, labeled on the left of the first panel only
+      row_split = if (first) row_group else NULL,
+      row_title_rot = 0, row_title_gp = gpar(fontsize = 9, fontface = "bold"),
+      row_gap = unit(1.5, "mm"),
+      show_row_names = first, row_names_side = "left",
+      row_names_gp = gpar(fontsize = 7, fontface = "italic"),
+      # column labels
+      column_title = title, column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+      column_names_rot = 0, column_names_centered = TRUE,
+      column_names_gp = gpar(fontsize = 9),
+      border = TRUE, rect_gp = gpar(col = "white", lwd = 0.5),
+      width = unit(ncol(mat) * 8, "mm"),
+      heatmap_legend_param = list(title = "Row z-score", at = c(-2, 0, 2),
+                                  labels = c("low", "0", "high"))
+    )
+  }
+
+  ht <- mk(z1, "Single cells\nsingle-cell clusters", first = TRUE) +
+        mk(z2, "Supercells\nsupercell clusters")
+  draw(ht,
+       column_title = paste0("Top ", n_per_cluster, " markers per cluster (selected from ",
+                             source_label, " data)"),
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+       heatmap_legend_side = "right", padding = unit(c(2, 2, 2, 8), "mm"))
+}
+
+# single-cell-derived markers (clusters labeled C0-C4)
+make_marker_heatmaps(objMarkers, marker_prefix = "C", source_label = "single-cell")
+
+# supercell-derived markers (clusters labeled S0-S4)
+make_marker_heatmaps(scMarkers, marker_prefix = "S", source_label = "supercell")
+
+```
+

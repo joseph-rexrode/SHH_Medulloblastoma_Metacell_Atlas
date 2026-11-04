@@ -1,0 +1,261 @@
+---
+title: "04 — SingleR"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+```
+
+## Import current object
+
+```{r}
+
+sample_files <- list.files(
+  path = here("Ghasemi_analysis", "results", "sample_results"),
+  pattern = "_object_with_decontX\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+sce <- readRDS(file = here("Ghasemi_analysis", "data", "hum_sce_final.rds"))
+
+counts <- assay(sce, "umi")
+labels <- sce$cell_type
+
+```
+
+## Processing
+
+```{r}
+
+# create empty pseudobulk matrix
+
+celltypes <- sort(unique(labels[!is.na(labels)]))
+
+pb_counts <- matrix(
+    0,
+    nrow = nrow(counts),
+    ncol = length(celltypes),
+    dimnames = list(
+        rownames(counts),
+        celltypes
+    )
+)
+
+# loop through each cell type
+
+for (i in seq_along(celltypes)) {
+  ct <- celltypes[i]
+  
+  print(paste0("Aggregating ", ct, "..."))
+  
+  keep <- !is.na(labels) & labels == ct
+  
+  pb_counts[, i] <- Matrix::rowSums(
+    counts[, keep, drop = FALSE]
+  )
+}
+
+# now we have pseudobulk matrix
+# log2 normalize to match author
+
+celltype_sizes <- colSums(pb_counts)
+
+cpm_matrix <- sweep(pb_counts, 2, celltype_sizes, FUN = "/") * 1000000
+
+log2_cpm_matrix <- log2(cpm_matrix + 1)
+
+cb_ref <- SingleCellExperiment(
+  assays = list(logcounts = as.matrix(log2_cpm_matrix))
+)
+
+colData(cb_ref)$celltypes <- colnames(log2_cpm_matrix)
+
+# ----------------------------
+# CHANGE ENSG ID to Gene Name
+
+rownames(cb_ref) <- gsub("\\..*", "", rownames(cb_ref))
+
+# 1. Generate matching gene symbols
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = rownames(cb_ref),
+  keytype = "ENSEMBL",
+  column = "SYMBOL",
+  multiVals = "first" # Drops duplicates by keeping the first match
+)
+
+# 2. Handle missing mappings (replace NA with the original ENSG ID)
+na_mask <- is.na(gene_symbols)
+gene_symbols[na_mask] <- rownames(cb_ref)[na_mask]
+
+# 3. Handle duplicate gene names (SingleCellExperiment requires UNIQUE row names)
+# This appends a suffix like .1, .2 to duplicate symbols
+unique_gene_names <- make.unique(as.character(gene_symbols))
+
+# 4. Assign the new gene names back to your reference object
+rownames(cb_ref) <- unique_gene_names
+
+ctrlName <- "cb_reference_annots"
+
+# Remapping Cell Types to Broader Categories
+
+# celltype_map <- c(
+#   astroglia = "Astrocytic",
+# 
+#   meningeal = "Perivascular/Stromal",
+#   `mural/endoth` = "Perivascular/Stromal",
+# 
+#   oligo = "Oligodendrocytes/OPCs",
+# 
+#   immune = "Monocytes/Endothelial",
+#   erythroid = "Monocytes/Endothelial",
+# 
+#   GABA_MB = "Malignant Cells",
+#   GC = "Malignant Cells",
+#   `GC/UBC` = "Malignant Cells",
+#   glut_DN = "Malignant Cells",
+#   glutamatergic_uncertain = "Malignant Cells",
+#   interneuron = "Malignant Cells",
+#   isthmic_neuroblast = "Malignant Cells",
+#   noradrenergic = "Malignant Cells",
+#   NTZ_mixed = "Malignant Cells",
+#   NTZ_neuroblast = "Malignant Cells",
+#   UBC = "Malignant Cells",
+#   VZ_neuroblast = "Malignant Cells",
+#   GABA_DN = "Malignant Cells",
+#   `isth_N` = "Malignant Cells",
+#   parabrachial = "Malignant Cells",
+#   Purkinje = "Malignant Cells"
+# )
+
+# cb_ref$celltypes_coarse <- dplyr::recode(cb_ref$celltypes, !!!celltype_map)
+
+for (inFile in sample_files) {
+  
+  print("========================================")
+  print("Processing file... ")
+  
+  base_name <- basename(inFile)
+  sID <- str_remove(base_name, "_object_with_decontX\\.(rds|Rdata)$")
+  
+  print(paste0("Load sample: ", sID))
+  
+  sObj <- readRDS(inFile) 
+  
+  expr_mat <- tryCatch(
+    {
+      LayerData(sObj, assay = "RNA", layer = "data")
+    },
+    error = function(e) {
+      GetAssayData(sObj, assay = "RNA", slot = "data")
+    }
+  )
+  
+  input_tumor <- SingleCellExperiment(
+    assays = list(logcounts = expr_mat)
+  )
+  
+  print(paste0("Running SingleR against: ", ctrlName))
+  
+  pred.cb <- SingleR(
+    test = input_tumor,
+    ref = cb_ref,
+    labels = cb_ref$celltypes,
+    assay.type.test = "logcounts",
+    assay.type.ref = "logcounts"
+  )
+  
+  # -----------------------------------------
+  # Store labels back in Seurat metadata
+  # -----------------------------------------
+  sObj$SingleR_label <- pred.cb$labels
+  sObj$SingleR_pruned <- pred.cb$pruned.labels
+  
+  sObj$cell_type <- pred.cb$labels
+  sObj$filtered_ct <- pred.cb$pruned.labels
+  
+  # -----------------------------------------
+  # Output filenames
+  # -----------------------------------------
+  out_dir <- dirname(inFile)
+  
+  resName1 <- file.path(
+    out_dir,
+    paste0(sID, "_singleR_", ctrlName, "_check.pdf")
+  )
+  
+  resName2 <- file.path(
+    out_dir,
+    paste0(sID, "_UMAP.", ctrlName, "_SingleR.pdf")
+  )
+  
+  resName3 <- file.path(
+    out_dir,
+    paste0(sID, "_SingleR_", ctrlName, "_ann.txt")
+  )
+  
+  resName4 <- file.path(
+    out_dir,
+    paste0(sID, "_object_with_SingleR.rds")
+  )
+  
+  # -----------------------------------------
+  # Diagnostic SingleR plots
+  # -----------------------------------------
+  pdf(resName1, width = 8, height = 6)
+  print(plotScoreHeatmap(pred.cb))
+  print(plotDeltaDistribution(pred.cb, ncol = 3))
+  dev.off()
+  
+  # -----------------------------------------
+  # Plot labels on UMAP if available
+  # -----------------------------------------
+  if ("umap" %in% names(sObj@reductions)) {
+    p <- DimPlot(
+      sObj,
+      reduction = "umap",
+      group.by = "SingleR_pruned",
+      label = TRUE,
+      repel = TRUE
+    )
+    
+    pdf(resName2, width = 8, height = 6)
+    print(p)
+    dev.off()
+  } else {
+    print("No UMAP found; skipping UMAP SingleR plot.")
+  }
+  
+  # -----------------------------------------
+  # Save annotation table
+  # -----------------------------------------
+  pred_df <- as.data.frame(pred.cb)
+  pred_df$cell <- rownames(pred_df)
+  
+  write.table(
+    pred_df,
+    resName3,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+  
+  # -----------------------------------------
+  # Save updated Seurat object
+  # -----------------------------------------
+  saveRDS(sObj, resName4)
+  
+  print(paste0("Finished sample: ", sID))
+  
+}
+
+
+```

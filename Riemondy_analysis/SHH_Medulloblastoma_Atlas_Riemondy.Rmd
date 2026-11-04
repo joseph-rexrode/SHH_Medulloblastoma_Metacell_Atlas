@@ -1,0 +1,439 @@
+---
+title: "SHH Medulloblastoma Riemondy Dataset"
+date: default
+output:
+  html_document: default
+  md_document:
+    variant: markdown_github
+    html_preview: false
+  pdf_document: default
+---
+
+**Riemondy et al, 2024**: <https://academic.oup.com/neuro-oncology/article/24/2/273/6291352?login=true>
+
+```{r setup, include=FALSE}
+library(knitr)
+# Global chunk options for all plots
+knitr::opts_chunk$set(
+  fig.width = 10,        # Set the width of the figures (in inches)
+  fig.height = 10,       # Set the height of the figures (in inches)
+  out.width = "100%",    # Make the figure occupy 100% of the page width
+  dpi = 300,             # Set the resolution to 300 DPI for high-quality output
+  echo = FALSE, 
+  message = FALSE,       # Suppress messages
+  warning = FALSE,       # Suppress warnings
+  cache = TRUE,
+  fig.retina = 2         # Set high DPI support for HTML (Retina displays)
+)
+```
+
+Libraries
+
+```{r}
+
+library(Seurat)
+library(SuperCell)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(tibble)
+library(harmony)
+library(presto)
+library(pheatmap)
+library(RColorBrewer)
+library(rmarkdown)
+library(stats)
+library(scales)
+library(Matrix)
+library(purrr)
+library(igraph)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(uwot)
+# library(biomaRt)
+library(data.table)
+library(readxl)
+library(SeuratWrappers)
+library(stringr)
+library(here)
+library(Matrix)
+```
+
+The purpose of this project is twofold:
+
+1)  to collate all available scRNA-seq and snRNA-seq data that exists for medulloblastoma mediated by the Sonic Hedgehog cell signaling pathway for characterization of cell types and marker gene expression.
+
+2)  to determine how metacell representation of single cell data can be preserved and optimized to categorize cell types.
+
+# Part 1
+
+*Note: It is not necessary to store images until the SHH cells have been filteredm, but I have done so for the processing steps and for the initial UMAP of the full dataset from Riemondy et al 2022 so you can compare to the original publication.*
+
+*Note: Since this dataset contains multiple medulloblastoma cell types, we pre-process the data. Some steps expected in pre-processing after the SHH cells are isolated are not performed.*
+
+```{r, warning = FALSE, message = FALSE, cache = FALSE}
+
+# Folder to save images in Part 1
+img_dir1_Riemondy <- file.path(here(), "Riemondy_analysis", "Riemondy_Images", "Part_1_Images")
+  
+if (!dir.exists(img_dir1_Riemondy)) dir.create(img_dir1_Riemondy)
+```
+
+### Step 1: Import data
+
+```{r, warning = FALSE, message = FALSE, cache = FALSE}
+
+# Load raw counts matrix
+raw_counts <- file.path(here(), 
+                        "Riemondy_analysis", 
+                        "data", 
+                        "GSE155446_human_raw_counts.csv.gz")
+counts_Riemondy <- read.csv(raw_counts, row.names = 1)
+
+# Set seed
+seed_value_Riemondy <- 20200204
+
+# Convert to matrix format
+counts_Riemondy <- as.matrix(counts_Riemondy)
+counts_Riemondy <- as(counts_Riemondy, "dgCMatrix")
+
+metafile <- file.path(here(), 
+                      "Riemondy_analysis", 
+                      "data", 
+                      "GSE155446_human_cell_metadata.csv.gz")
+metadata_Riemondy <- read.csv(metafile, row.names = 1, stringsAsFactors = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE, cache=TRUE}
+
+# Create Seurat object (check cell amount)
+Riemondy <- CreateSeuratObject(
+  counts_Riemondy,
+  project = "GSE155446",
+  min.cells = 3,
+  min.features = 200,
+  names.delim = "_",
+  names.field = 1
+)
+
+rm(counts_Riemondy)
+
+metadata_Riemondy$cell_id <- rownames(metadata_Riemondy)
+metadata_Riemondy$cell_id[metadata_Riemondy$cell_id == "934"] <- "943"
+metadata_Riemondy$cell_id[metadata_Riemondy$cell_id == "966-2"] <- "966_2"
+metadata_Riemondy$recurrence <- ifelse(metadata_Riemondy$cell_id == "966_2",
+                                       "Recurrence",
+                                       "Non-recurrence")
+
+rownames(metadata_Riemondy) <- metadata_Riemondy$cell_id
+
+Riemondy <- AddMetaData(Riemondy, metadata_Riemondy)
+Riemondy[["percent.mt"]] <- PercentageFeatureSet(Riemondy, pattern = "^MT-")
+```
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+head(Riemondy@meta.data)
+```
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+cat("Columns in Seurat object:", ncol(Riemondy@meta.data), "\n")
+cat("Rows in Seurat object:", nrow(Riemondy@meta.data), "\n")
+cat("Number of patients in Seurat object:", length(unique(Riemondy$UPN)), "\n")
+
+```
+
+### Step 2: Data Filtering
+
+#### Violin Plots
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+# # Violin plot for percent.mt
+# violin_plot_mt <- VlnPlot(Riemondy, features = c("percent.mt"), group.by = "subgroup") +
+#   labs(x = "subgroup", y = "Percent UMIs from Mitochondria") +
+#   geom_hline(aes(yintercept = 30), linetype = "dashed") +
+#   patchwork::plot_layout(guides = "collect")
+# 
+# # violin plot for genes
+# violin_plot_gene <- VlnPlot(Riemondy, features = c("nFeature_RNA"), group.by = "subgroup") +
+#   labs(x = "subgroup", y = "Feature RNAs") +
+#   geom_hline(aes(yintercept = 30), linetype = "dashed") +
+#   patchwork::plot_layout(guides = "collect")
+# 
+# # violin plot for RNA amount
+# violin_plot_umi <- VlnPlot(Riemondy, features = c("nCount_RNA"), group.by = "subgroup") +
+#   labs(x = "subgroup", y = "RNA counts") +
+#   geom_hline(aes(yintercept = 30), linetype = "dashed") +
+#   patchwork::plot_layout(guides = "collect")
+# 
+# combined_violin <- violin_plot_mt | violin_plot_gene | violin_plot_umi
+# combined_violin
+# 
+# # Save Image
+# ggsave(file.path(img_dir1, "combined_violin_plots_RiemondyFullDataset.png"), plot = combined_violin, width = 12, height = 4)
+```
+
+#### Scatterplot
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+# Scatter plot
+plot1 <- FeatureScatter(Riemondy, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(Riemondy, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+combinedScatter <- plot1 + plot2
+combinedScatter
+
+# Save Image
+ggsave(file.path(img_dir1_Riemondy, "combinedScatter_Riemondy_Full_Dataset.png"), plot = combinedScatter, width = 20, height = 8, bg = "white")
+```
+
+#### Highly variable genes
+
+```{r, message = FALSE, warning = FALSE, cache = FALSE}
+
+Riemondy <- FindVariableFeatures(Riemondy, nfeatures = 3000)
+
+top_features <- head(VariableFeatures(Riemondy), 20)
+plot1 <- VariableFeaturePlot(Riemondy)
+plot2 <- LabelPoints(plot = plot1, points = top_features, repel = TRUE)
+
+combinedVariableFeatures_All <- plot1 + plot2
+combinedVariableFeatures_All
+
+# Save Image
+ggsave(file.path(img_dir1_Riemondy, "combinedVariableFeatures_Riemondy_Full_Dataset.png"), plot = combinedVariableFeatures_All, width = 12, height = 9, bg = "white")
+```
+
+#### Annotating subtypes
+
+```{r, message = FALSE, warning = FALSE, cache = FALSE}
+
+Riemondy@meta.data %>% 
+  group_by(UPN) %>% 
+  summarize(median_percent_mito = median(percent.mt), 
+            mean_percent_mito = mean(percent.mt)) %>% 
+  arrange(desc(median_percent_mito))
+
+sample_names <- as.character(unique(Riemondy@meta.data$orig.ident))
+per_sample <- map(sample_names, ~filter(Riemondy@meta.data, 
+                                        orig.ident == .x))
+
+# check Line 232 for relationship between UMI and percent mitochondria
+
+Riemondy <- subset(Riemondy, subset = percent.mt < 30)
+Riemondy <- subset(Riemondy, subset = nCount_RNA < 40000)
+Riemondy <- subset(Riemondy, subset = nCount_RNA > 500)
+
+
+annots <- Riemondy@meta.data %>% 
+  select(UPN, subgroup) %>% 
+  unique() %>%
+  arrange(subgroup)
+
+subgroup_order <- c(
+  "SHH",
+  "GP3",
+  "GP3/4",
+  "GP4",
+  "WNT"
+)
+
+```
+
+#### Scree plot (selecting top PCs)
+
+```{r, message = FALSE, warning = FALSE, cache = FALSE}
+
+annots <- mutate(annots, subgroup = factor(subgroup, levels = subgroup_order))
+
+annots <- annots %>% arrange(subgroup, as.numeric(UPN))
+
+sample_order <- annots$UPN 
+
+Riemondy@meta.data$UPN <- factor(Riemondy@meta.data$UPN, levels = sample_order)
+Riemondy@meta.data$subgroup <- factor(Riemondy@meta.data$subgroup, levels = subgroup_order)
+
+Riemondy <- NormalizeData(Riemondy)
+
+Riemondy <- FindVariableFeatures(
+  Riemondy,
+  selection.method = "vst",
+  nfeatures = 4000,
+  verbose = FALSE
+)
+
+Riemondy <- ScaleData(Riemondy, verbose = TRUE)
+
+Riemondy <- RunPCA(Riemondy, 
+             npcs = 40, 
+             verbose = FALSE, 
+             seed.use = seed_value_Riemondy)
+
+PC_ElbowPlot <- ElbowPlot(Riemondy, ndims = 40)
+
+PC_ElbowPlot
+
+# Save Image
+ggsave(file.path(img_dir1_Riemondy, "PC_ElbowPlot_Riemondy_Full_Dataset.png"), plot = PC_ElbowPlot, width = 12, height = 4, bg = "white")
+```
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+
+Riemondy <- FindNeighbors(Riemondy, 
+                    reduction = "pca", 
+                    dims = 1:40, 
+                    k.param = 20L)
+
+Riemondy <- RunUMAP(Riemondy, 
+              reduction = "pca",
+              dims = 1:40,
+              min.dist = 0.4, 
+              seed.use = seed_value_Riemondy)
+
+Riemondy <- FindClusters(Riemondy, 
+                   resolution = c(0.1, 0.2, 0.3, 0.5),
+                   random.seed = seed_value_Riemondy)
+
+Riemondy$coarse_clusters <- Riemondy$RNA_snn_res.0.1
+
+Idents(Riemondy) <- "coarse_clusters"
+
+palette_OkabeIto <- c("#dca4ff", "#e1ffac", "#ffda40", "#efe03a", 
+                      "#78ffe2", "#f7b5ff", "#89c8ff", "#999999")
+
+UMAPPlot(Riemondy, 
+        group.by = "subgroup",    # Group cells by 'subgroup' metadata
+        cols = palette_OkabeIto,  
+        label = TRUE,             # Display labels
+        label.size = 4,           # Set label size
+        label.color = "black",    # Set label color
+        shuffle = TRUE)  
+
+DimPlot(Riemondy, reduction = "umap", group.by = "subgroup")
+cids <- as.numeric(as.character(Riemondy$coarse_clusters)) %>% unique() %>% sort()
+
+
+```
+
+### Step 3: SHH Isolation, Feature Selection, and Heterogeneity Analysis
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Riemondy <- subset(Riemondy, subset = subgroup == "SHH")
+
+valid_subpops <- paste0("SHH-", c("A1","A2","B1","B2","C1","C2"))
+
+Riemondy <- subset(
+  Riemondy,
+  subset = tumor_subpopulation %in% valid_subpops
+)
+
+# Feature selection (VST method)
+Riemondy <- FindVariableFeatures(
+  Riemondy,
+  selection.method = "vst",
+  nfeatures = 3000
+)
+
+# Extract top 10 variable features
+top10_Riemondy <- head(VariableFeatures(Riemondy), 10)
+cat("Top 10 variable features:", paste(top10_Riemondy, collapse = ", "), "\n")
+
+# Variable feature plot
+VF_plot1_Riemondy <- VariableFeaturePlot(Riemondy)
+
+# Labeled top features
+VF_plot2_Riemondy <- LabelPoints(
+  plot   = VF_plot1_Riemondy,
+  points = top10_Riemondy,
+  repel  = TRUE
+)
+
+# Combined visualization
+wrap_plots(VF_plot1_Riemondy, VF_plot2_Riemondy, ncol = 2)
+```
+
+### Step 4: Data Scaling
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+Riemondy <- ScaleData(Riemondy, vars.to.regress = "percent.mt")
+```
+
+### Step 5: PCA
+
+```{r}
+
+Riemondy <- RunPCA(Riemondy, npcs = 50, seed.use = seed_value_Riemondy)
+
+PC_ElbowPlot_Riemondy <- ElbowPlot(Riemondy,ndims = ncol(Embeddings(Riemondy, "pca"))
+)
+
+# Save Images
+ggsave(file.path(img_dir1_Riemondy, "PC_ElbowPlot_Riemondy.png"),plot = PC_ElbowPlot_Riemondy, width = 12,height = 4,bg = "white")
+
+DimHeatmap(Riemondy,dims = 1:20,cells = 100,balanced = TRUE)
+
+PCs_Heatmap_Riemondy_file <- file.path(img_dir1_Riemondy,"PCs_Heatmap_Riemondy.png")
+
+png(filename = PCs_Heatmap_Riemondy_file,width = 2000,height = 5000,res = 150,bg = "white")
+
+DimHeatmap(Riemondy,dims = 1:20,cells = 100,balanced = TRUE)
+
+dev.off()
+
+PC_ElbowPlot_Riemondy
+
+Idents(Riemondy) <- "tumor_subpopulation"
+
+```
+
+Step 7
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+
+subpop_colors <- c(
+  "SHH-A1" = "red",
+  "SHH-A2" = "orange",
+  "SHH-B1" = "gold",
+  "SHH-B2" = "green",
+  "SHH-C1" = "skyblue",
+  "SHH-C2" = "violet"
+)
+
+Riemondy <- FindNeighbors(Riemondy, dims = 1:30)
+
+Riemondy <- RunUMAP(Riemondy,dims = 1:30,min.dist = 0.3,n.neighbors = 30,seed.use = seed_value_Riemondy
+)
+
+Riemondy <- FindClusters(Riemondy,resolution = 0.1,random.seed = seed_value_Riemondy)
+
+p1_Riemondy_Control <- DimPlot(Riemondy,group.by = "tumor_subpopulation",cols = subpop_colors) + ggtitle("Negative Control")
+
+Riemondy <- RunHarmony(Riemondy,group.by.vars = "UPN",theta = 3.0)
+
+Riemondy <- RunUMAP(Riemondy,reduction = "harmony",dims = 1:30,min.dist = 0.3,n.neighbors = 30,seed.use = seed_value_Riemondy)
+
+Riemondy <- FindClusters(Riemondy,resolution = 0.3,random.seed = seed_value_Riemondy)
+
+p2_Riemondy_Harmony <- DimPlot(Riemondy,group.by = "tumor_subpopulation",cols = subpop_colors) + ggtitle("Harmony alignment")
+
+Negative_Control_v_Harmony_Riemondy <- p1_Riemondy_Control | p2_Riemondy_Harmony 
+Negative_Control_v_Harmony_Riemondy
+
+# Save Image
+ggsave(file.path(img_dir1_Riemondy, "Negative_Control_v_Harmony_Riemondy.png"), plot = Negative_Control_v_Harmony_Riemondy, width = 20, height = 10, bg = "white")
+
+saveRDS(Riemondy, 
+        file = file.path(here(), 
+                         "Riemondy_analysis", 
+                         "results", 
+                         "Riemondy_object.rds"),
+        compress = "xz")
+```

@@ -1,0 +1,163 @@
+---
+title: "02 — DecontX"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+```
+
+## Importing Object From Previous Step
+
+```{r}
+
+sample_files <- list.files(
+  path = here("Ghasemi_analysis", "results", "sample_results"),
+  pattern = "_object\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+```
+
+## Processing
+
+```{r}
+
+for (inFile in sample_files) {
+  
+  print("========================================")
+  print("Processing file... ")
+  
+  # -----------------------------------------
+  # Parse sample ID from filename
+  # -----------------------------------------
+  base_name <- basename(inFile)
+  sID <- str_remove(base_name, "_object\\.(rds|Rdata)$")
+  
+  print(paste0("Sample ID: ", sID))
+  
+  # -----------------------------------------
+  # Load Seurat object
+  # -----------------------------------------
+  tumObj <- readRDS(inFile)
+  
+  # -----------------------------------------
+  # Extract raw counts
+  # -----------------------------------------
+  counts_tumor <- tryCatch(
+    {
+      LayerData(tumObj, assay = "RNA", layer = "counts")
+    },
+    error = function(e) {
+      GetAssayData(tumObj, assay = "RNA", slot = "counts")
+    }
+  )
+  
+  # -----------------------------------------
+  # Convert to SingleCellExperiment
+  # -----------------------------------------
+  input_tumor <- SingleCellExperiment(
+    assays = list(counts = counts_tumor)
+  )
+  
+  # If clusters are present, pass them to DecontX
+  if ("seurat_clusters" %in% colnames(tumObj@meta.data)) {
+    colData(input_tumor)$seurat_clusters <- tumObj$seurat_clusters
+  }
+  
+  # -----------------------------------------
+  # Run DecontX
+  # -----------------------------------------
+  print("Running DecontX...")
+  
+  decont_tumor <- if ("seurat_clusters" %in% colnames(colData(input_tumor))) {
+    decontX(
+      x = input_tumor,
+      z = colData(input_tumor)$seurat_clusters
+    )
+  } else {
+    decontX(x = input_tumor)
+  }
+  
+  # -----------------------------------------
+  # Define output file names
+  # -----------------------------------------
+  out_dir <- dirname(inFile)
+  
+  f_check_pdf  <- file.path(out_dir, paste0(sID, "_decontX_check.pdf"))
+  f_umap_pdf   <- file.path(out_dir, paste0(sID, "_UMAP_decontX_res.pdf"))
+  f_decont_rds <- file.path(out_dir, paste0(sID, "_decontX.rds"))
+  f_ann_txt    <- file.path(out_dir, paste0(sID, "_decontX_ann.txt"))
+  f_seurat_rds <- file.path(out_dir, paste0(sID, "_object_with_decontX.rds"))
+  
+  # -----------------------------------------
+  # Plot DecontX diagnostics
+  # -----------------------------------------
+  print("Drawing figures...")
+  
+  pdf(f_check_pdf)
+  
+  if ("decontX_UMAP" %in% reducedDimNames(decont_tumor)) {
+    umap <- reducedDim(decont_tumor, "decontX_UMAP")
+    plotDimReduceCluster(
+      x = decont_tumor$decontX_clusters,
+      dim1 = umap[, 1],
+      dim2 = umap[, 2]
+    )
+  }
+  
+  plotDecontXContamination(decont_tumor)
+  dev.off()
+  
+  # -----------------------------------------
+  # Add contamination back to Seurat metadata
+  # -----------------------------------------
+  tumObj$decontX_contamination <- decont_tumor$decontX_contamination
+  
+  # -----------------------------------------
+  # Plot contamination on existing Seurat UMAP
+  # -----------------------------------------
+  if ("umap" %in% names(tumObj@reductions)) {
+    pdf(f_umap_pdf, width = 8, height = 6)
+    print(
+      FeaturePlot(
+        tumObj,
+        reduction = "umap",
+        features = "decontX_contamination"
+      )
+    )
+    dev.off()
+  } else {
+    print("No UMAP found in Seurat object; skipping FeaturePlot.")
+  }
+  
+  # -----------------------------------------
+  # Save outputs
+  # -----------------------------------------
+  print("Saving outputs...")
+  
+  saveRDS(decont_tumor, f_decont_rds)
+  saveRDS(tumObj, f_seurat_rds)
+  
+  resDf <- data.frame(
+    cell = colnames(decont_tumor),
+    decontX_contamination = decont_tumor$decontX_contamination
+  )
+  
+  write.table(
+    resDf,
+    f_ann_txt,
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+  
+  print(paste0("Finished sample: ", sID))
+}
+
+```

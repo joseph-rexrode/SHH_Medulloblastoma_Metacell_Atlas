@@ -1,0 +1,58 @@
+---
+title: "03 — DecontX Filtering"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+```
+
+## FILTERING DECONTX OBJECT TO REMOVE POTENTIAL DOUBLETS
+
+### MAYBE DONT DO THIS LOL
+
+```{r}
+sample_files <- list.files(
+  path = here("Ghasemi_analysis", "results", "sample_results"),
+  pattern = "_object_with_decontX\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+sample_files
+
+newTotalCells <- 0
+
+for (inFile in sample_files) {
+  
+  base_name <- basename(inFile)
+  sID <- str_remove(base_name, "_object_with_decontX\\.(rds|Rdata)$")
+  
+  print(paste0("Load sample: ", sID))
+  
+  sObj <- readRDS(inFile) 
+  
+  maxContam <- 0.6
+  
+  newObj <- subset(sObj, subset = decontX_contamination < maxContam)
+  
+  out_dir <- dirname(inFile)
+  
+  f_seurat_rds <- file.path(out_dir, paste0(sID, "_object_with_decontX_FILTERED.rds"))
+  
+  saveRDS(newObj, f_seurat_rds)
+  
+  print(paste0("Num Cells Before Filter: ", ncol(sObj)))
+
+  print(paste0("Num Cells After Filter: ", ncol(newObj)))
+  
+  newTotalCells <- newTotalCells + ncol(newObj)
+  
+  print(paste0("Finished sample: ", sID))
+}
+
+```

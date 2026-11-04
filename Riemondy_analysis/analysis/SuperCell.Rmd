@@ -1,0 +1,428 @@
+---
+title: "SuperCell"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(here)
+library(SuperCell)
+library(mclust)
+library(grid)
+library(pheatmap)
+library(dplyr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+library(Seurat)
+library(harmony)
+
+```
+
+## Import Object 
+
+```{r}
+
+o <- readRDS(file.path(here(),
+                       "Riemondy_analysis",
+                       "results",
+                       "Riemondy_object.rds"))
+
+```
+
+```{r}
+
+sc_list <- list()
+membership_list <- list()
+
+for (s in unique(o$UPN)) {
+  obj <- subset(x = o, subset = UPN == s)
+  sample_id <- s
+  norm <- GetAssayData(obj, assay = "RNA", layer = "data")
+  raw  <- GetAssayData(obj, assay = "RNA", layer = "counts")
+  
+  scell <- SCimplify(norm, 
+                     k.knn = 5, 
+                     gamma = 10,
+                     n.var.genes = 2000, 
+                     verbose = FALSE,
+                     n.pc = 10)
+  
+  cat(sample_id, ": ", ncol(obj), " cells -> ", length(unique(scell$membership)), " supercells\n", sep = "")
+  
+  membership_list[[s]] <- scell$membership
+  
+  mem <- scell$membership
+  ids <- sort(unique(mem))
+  
+  # Majority cell type + size per supercell
+  meta <- data.frame(ct = obj$tumor_subpopulation[names(scell$membership)],
+                   sc = scell$membership) |>
+  dplyr::group_by(sc) |>
+  dplyr::summarize(
+    cell_type = names(which.max(table(ct))),
+    sc_size   = dplyr::n(),
+    purity    = max(table(ct)) / dplyr::n()
+  ) |>
+  as.data.frame()
+  rownames(meta) <- paste0(sample_id, "_SC", meta$sc)
+  meta$pt_id <- sample_id
+  meta$dataset <- "Riemondy"
+
+  
+  # Sum RAW counts
+
+  G <- Matrix::sparseMatrix(
+    i = match(names(mem), colnames(raw)),
+    j = match(mem, ids),
+    x = 1,
+    dims = c(ncol(raw), length(ids)),
+    dimnames = list(colnames(raw), as.character(ids))
+  )
+
+  SC.counts <- raw %*% G
+  colnames(SC.counts) <- paste0(sample_id, "_SC", ids)
+
+  stopifnot(!anyNA(match(names(mem), colnames(raw))))   # every cell found
+  stopifnot(sum(SC.counts) == sum(raw))                 # no counts lost
+  stopifnot(all(colnames(SC.counts) == rownames(meta))) # matches meta block
+  
+
+  so <- CreateSeuratObject(counts = SC.counts, meta.data = meta[colnames(SC.counts), ])
+  sc_list[[sample_id]] <- so
+  
+  saveRDS(so, file.path(here(),
+                        "Riemondy_analysis",
+                        "results",
+                        paste0(sample_id, "_scObject.rds")),
+          compress = "xz")
+  
+}
+
+merged <- merge(sc_list[[1]], sc_list[-1])
+merged <- JoinLayers(merged)
+merged <- NormalizeData(merged) |> FindVariableFeatures() |> ScaleData() |> RunPCA()
+merged <- RunHarmony(
+  merged,
+  group.by.vars = "pt_id",
+  theta = 3
+)
+
+ndim <- 30
+
+merged <- FindNeighbors(
+    merged,
+    reduction = "harmony",
+    dims = 1:ndim
+)
+  
+merged <- FindClusters(
+    merged,
+    resolution = 0.26,
+    random.seed = 20200204
+)
+  
+merged <- RunUMAP(
+    merged,
+    reduction = "harmony",
+    dims = 1:ndim,
+    seed.use = 20200204,
+    min.dist = 0.3
+  )
+
+# # 1. Extract the current embeddings matrix
+# mat <- Embeddings(merged, reduction = "umap")
+# 
+# # 2. Flip the first column (X-axis)
+# mat[, 2] <- -1 * mat[, 2]
+# mat[, 1] <- -1 * mat[, 1]
+# 
+# merged[["umap"]] <- CreateDimReducObject(
+#   embeddings = mat, 
+#   key = "UMAP_", 
+#   assay = DefaultAssay(merged)
+# )
+# 
+# merged@tools$PlotData <- NULL
+# 
+# # 5. Re-plot
+# DimPlot(merged, reduction = "umap")
+
+subpop_colors <- c(
+  "SHH-A1" = "red",
+  "SHH-A2" = "orange",
+  "SHH-B1" = "gold",
+  "SHH-B2" = "green",
+  "SHH-C1" = "skyblue",
+  "SHH-C2" = "violet"
+)
+
+combinedDimPlot <- DimPlot(
+    merged,
+    reduction = "umap",
+    group.by = "cell_type",
+    cols = subpop_colors
+  ) +
+  labs(title = "Riemondy: All Patients - SC + Harmony")
+
+ggsave(file.path(here("Riemondy_analysis", "results"), "sc_combined_Dim_Plot.png"),
+       plot = combinedDimPlot,
+       width = 12,
+       height = 10,
+       bg = "white")
+
+
+```
+
+## Visualization
+
+```{r}
+
+without_supercell <- o
+
+p1 <- DimPlot(
+    without_supercell,
+    reduction = "umap",
+    group.by = "tumor_subpopulation",
+    cols = subpop_colors
+  ) +
+  labs(title = "Riemondy: All Patients - Harmony") 
+
+sideBySide <- p1 | combinedDimPlot
+
+sideBySide
+
+ggsave(file.path(here(), 
+                 "Riemondy_analysis", 
+                 "results", 
+                 "Riemondy_Harmony_and_SCHarmony.png"),
+       plot = sideBySide,
+       width = 16,
+       height = 8,
+       bg = "white")
+
+```
+
+
+```{r}
+
+## CELL -> SUPERCELL LOOKUP
+
+# Cell -> supercell table from membership_list
+membership_df <- purrr::imap_dfr(membership_list, function(m, s) {
+  data.frame(
+    cell   = names(m),
+    sample = s,
+    sc_id  = paste0(s, "_SC", as.integer(m))   # matches colnames(merged)
+  )
+})
+
+# Sanity check: do the barcodes match the object on the left plot?
+mean(membership_df$cell %in% colnames(without_supercell))
+mean(colnames(without_supercell) %in% membership_df$cell)
+
+## ADD SUPERCELL INFO
+
+without_supercell$sc_id <- membership_df$sc_id[
+  match(colnames(without_supercell), membership_df$cell)
+]
+
+# Pull supercell-level info from the merged SC object
+sc_meta <- merged@meta.data[, c("cell_type", "sc_size", "purity", "pt_id")]
+
+without_supercell$sc_celltype <- sc_meta[without_supercell$sc_id, "cell_type"]
+without_supercell$sc_size    <- sc_meta[without_supercell$sc_id, "sc_size"]
+without_supercell$sc_purity  <- sc_meta[without_supercell$sc_id, "purity"]
+
+# How do original cell types map to SC cell types?
+contingency_matrix <- table(original = without_supercell$tumor_subpopulation,
+      sc_celltype = without_supercell$sc_celltype, useNA = "ifany")
+
+prob_matrix <- prop.table(contingency_matrix, margin = 1) * 100
+
+col_order <- c("SHH-A1", "SHH-A2", "SHH-B1", "SHH-B2", "SHH-C1", "SHH-C2")
+prob_matrix <- prob_matrix[, col_order]
+
+Heatmap(
+  matrix = prob_matrix,
+  name = "Matching %",
+  col = colorRamp2(c(0, 100), c("#A690A4", "#5E4B56")),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_title = "Cell Type Identity",
+  column_title = "SuperCell Cell Type Identity",
+  rect_gp = gpar(col = "gray", width = 2),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+          # grid.text places the text exactly inside each cell
+          grid.text(paste0(sprintf("%.1f", prob_matrix[i, j]), "%"), x, y, 
+                    gp = gpar(fontsize = 16, col = "white"))}
+)
+
+
+## PLOT SUPERCELL ASSIGNMENTS ONTO SINGLE CELL EMBEDDING
+
+# Original cells colored by the cluster their supercell received
+p_sc_cluster <- DimPlot(without_supercell, 
+                        reduction = "umap",
+                        group.by = "sc_celltype", 
+                        raster = FALSE,
+                        cols = subpop_colors) +
+  labs(title = "Original cells colored by SC-cell type")
+
+# Supercell size and purity per cell
+p_size   <- FeaturePlot(without_supercell, "sc_size",   reduction = "umap", raster = FALSE)
+p_purity <- FeaturePlot(without_supercell, "sc_purity", reduction = "umap", raster = FALSE)
+
+all3 <- p_sc_cluster | p_size | p_purity
+
+normalvsuper <- p_sc_cluster | p1
+
+ggsave(file.path(here(), 
+                 "Riemondy_analysis",
+                 "results",
+                 "superimposition_SC_Normal_withSize_and_Purity.png"),
+       plot = all3,
+       width = 24,
+       height = 10,
+       bg = "white")
+
+ggsave(file.path(here(), 
+                 "Riemondy_analysis", 
+                 "results",
+                 "superimposition_SC_NormalComparison.png"),
+       plot = normalvsuper,
+       width = 16,
+       height = 10,
+       bg = "white")
+
+## SHOW SUPERCELL CENTROIDS
+
+emb <- as.data.frame(Embeddings(without_supercell, "umap"))
+colnames(emb) <- c("UMAP_1", "UMAP_2")
+emb$sc_id <- without_supercell$sc_id
+emb$sample <- without_supercell$UPN
+
+centroids <- emb |>
+  dplyr::filter(!is.na(sc_id)) |>
+  dplyr::group_by(sc_id) |>
+  dplyr::summarize(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    n      = dplyr::n(),
+    sample = dplyr::first(sample),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(sc_celltype = sc_meta[sc_id, "cell_type"])
+
+ggplot() +
+  geom_point(data = emb, aes(UMAP_1, UMAP_2), color = "grey85", size = 0.2) +
+  geom_point(data = centroids, aes(UMAP_1, UMAP_2, size = n, color = sc_celltype),
+             alpha = 0.8) +
+  scale_size_continuous(range = c(0.5, 6)) +
+  theme_classic() +
+  labs(title = "SuperCell centroids on original UMAP")
+
+## IS GAP PATIENT SPECIFIC?
+
+DimPlot(without_supercell, reduction = "umap", group.by = "tumor_subpopulation",
+        split.by = "UPN", ncol = 4, raster = FALSE)
+
+```
+
+```{r}
+
+Idents(without_supercell) <- "tumor_subpopulation"
+
+objMarkers <- FindAllMarkers(without_supercell, 
+                             only.pos = FALSE, 
+                             min.pct = 0, 
+                             logfc.threshold = 0)
+
+Idents(merged) <- "cell_type"
+
+scMarkers <- FindAllMarkers(merged, 
+                            only.pos = FALSE, 
+                            min.pct = 0, 
+                            logfc.threshold = 0)
+
+
+```
+
+
+```{r}
+
+## HEATMAP FOR TOP 6 MARKERS 
+
+make_marker_heatmaps <- function(markers, marker_prefix = "C", n_per_cluster = 6,
+                                 source_label = "single-cell") {
+
+  # only genes present in both objects
+  shared <- intersect(rownames(without_supercell), rownames(merged))
+
+  top <- markers |>
+    filter(gene %in% shared, avg_log2FC > 0, pct.1 > 0.25) |>
+    group_by(cluster) |>
+    slice_max(avg_log2FC, n = n_per_cluster, with_ties = FALSE) |>
+    ungroup() |>
+    distinct(gene, .keep_all = TRUE) |>
+    arrange(as.numeric(as.character(cluster)), desc(avg_log2FC))
+
+  genes <- top$gene
+  row_group <- factor(paste0(marker_prefix, top$cluster, " markers"),
+                      levels = unique(paste0(marker_prefix, top$cluster, " markers")))
+
+  avg_z <- function(obj, group_by, prefix) {
+    a <- AverageExpression(obj, features = genes, group.by = group_by,
+                           assays = "RNA", layer = "data")$RNA
+    a <- log1p(as.matrix(a))
+    colnames(a) <- sub("^g", "", colnames(a))
+    a <- a[genes, order(as.numeric(colnames(a))), drop = FALSE]
+    z <- t(scale(t(a)))
+    colnames(z) <- paste0(prefix, colnames(z))
+    z
+  }
+
+  z1 <- avg_z(without_supercell, "tumor_subpopulation", "C")
+  z2 <- avg_z(merged,            "cell_type",   "S")
+
+  col_fun <- colorRamp2(c(-2, 0, 2), c("navy", "white", "firebrick"))
+
+  mk <- function(mat, title, first = FALSE) {
+    Heatmap(
+      mat, name = "Row z-score", col = col_fun,
+      cluster_rows = FALSE, cluster_columns = FALSE,
+      # marker blocks: split once, labeled on the left of the first panel only
+      row_split = if (first) row_group else NULL,
+      row_title_rot = 0, row_title_gp = gpar(fontsize = 9, fontface = "bold"),
+      row_gap = unit(1.5, "mm"),
+      show_row_names = first, row_names_side = "left",
+      row_names_gp = gpar(fontsize = 7, fontface = "italic"),
+      # column labels
+      column_title = title, column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+      column_names_rot = 0, column_names_centered = TRUE,
+      column_names_gp = gpar(fontsize = 9),
+      border = TRUE, rect_gp = gpar(col = "white", lwd = 0.5),
+      width = unit(ncol(mat) * 8, "mm"),
+      heatmap_legend_param = list(title = "Row z-score", at = c(-2, 0, 2),
+                                  labels = c("low", "0", "high"))
+    )
+  }
+
+  ht <- mk(z1, "Single cells\nsingle-cell clusters", first = TRUE) +
+        mk(z2, "Supercells\nsupercell clusters")
+  draw(ht,
+       column_title = paste0("Top ", n_per_cluster, " markers per cluster (selected from ",
+                             source_label, " data)"),
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+       heatmap_legend_side = "right", padding = unit(c(2, 2, 2, 8), "mm"))
+}
+
+# single-cell-derived markers (clusters labeled C0-C4)
+make_marker_heatmaps(objMarkers, marker_prefix = "C", source_label = "single-cell")
+
+# supercell-derived markers (clusters labeled S0-S4)
+make_marker_heatmaps(scMarkers, marker_prefix = "S", source_label = "supercell")
+
+```
+

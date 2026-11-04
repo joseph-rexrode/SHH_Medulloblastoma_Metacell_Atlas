@@ -1,0 +1,306 @@
+---
+title: "01 — QC and Preprocessing"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+```
+
+--
+
+## Load Samples
+
+```{r}
+
+sample_files <- list.files(
+  file.path(dataPath, "raw_counts"),
+  pattern = "raw_counts\\.tsv\\.gz$",
+  full.names = TRUE
+)
+
+print(sample_files)
+
+
+print(paste("Input data:", dataPath))
+
+totalBefore <- 0
+totalCells <- 0
+
+```
+
+## Processing
+
+```{r}
+
+for (file in sample_files) {
+  
+  # sample ID from file name
+  parts <- strsplit(basename(file), "_")[[1]]
+  sID <- parts[3]
+  
+  resDir <- paste0(mainDir, "/", sID, "_res")
+  
+  if (!file.exists(resDir)) {
+    dir.create(resDir)
+  }
+  
+  print(paste("Processing: ", sID))
+  
+  counts <- fread(file)
+  
+  counts <- as.data.frame(counts)
+  
+  rownames(counts) <- counts[,1]
+  
+  counts <- counts[,-1]
+  
+  counts <- as(as.matrix(counts), "dgCMatrix")
+  
+  cb <- CreateSeuratObject(
+    counts = counts,
+    min.cells = 5,
+    min.features = 300,
+    project = sID
+  )
+  
+  cb[["percent.mt"]] <- PercentageFeatureSet(cb, pattern = "^MT-")
+
+  print("QC report...")
+  
+  # Violin plots
+  
+  violin_plot_mt <- VlnPlot(cb, features = c("percent.mt")) +
+    labs(y = "Percent UMIs from Mitochondria") +
+    geom_hline(aes(yintercept = 30), linetype = "dashed") +
+    patchwork::plot_layout(guides = "collect")
+  
+  violin_plot_gene <- VlnPlot(cb, features = c("nFeature_RNA")) +
+    labs(y = "Feature RNAs") +
+    geom_hline(aes(yintercept = 30), linetype = "dashed") +
+    patchwork::plot_layout(guides = "collect")
+
+  violin_plot_umi <- VlnPlot(cb, features = c("nCount_RNA")) +
+    labs(y = "RNA counts") +
+    geom_hline(aes(yintercept = 30), linetype = "dashed") +
+    patchwork::plot_layout(guides = "collect")
+
+  combined_violin <- violin_plot_mt | violin_plot_gene | violin_plot_umi
+  combined_violin
+  
+  ggsave(file.path(resDir, "violin_plot_initial.png"), 
+         plot = combined_violin,
+         width = 12, 
+         height = 4)
+  
+  ndim = 10
+  
+  # Histogram
+  
+  plot_data <- FetchData(
+    object = cb,
+    vars = c("percent.mt", "nCount_RNA", "nFeature_RNA")
+  )
+  
+  hist_plot_mt <- ggplot(data = plot_data, mapping = aes(x = percent.mt)) + 
+                    geom_histogram() +
+                    labs(x = "Percent UMIs from Mitochondria")
+  
+  hist_plot_gene <- ggplot(data = plot_data, mapping = aes(x = nFeature_RNA)) + 
+                    geom_histogram() +
+                    labs(x = "Feature RNAs")
+  
+  hist_plot_umi <- ggplot(data = plot_data, mapping = aes(x = nCount_RNA)) + 
+                    geom_histogram() +
+                    labs(x = "RNA Counts")
+  
+  combined_hist <- hist_plot_mt | hist_plot_gene | hist_plot_umi
+  
+  ggsave(file.path(resDir, "hist_plot_initial.png"),
+         plot = combined_hist)
+  
+  # Scatter plots
+  
+  plot1 <- FeatureScatter(cb, feature1 = "nCount_RNA", feature2 = "percent.mt")
+  plot2 <- FeatureScatter(cb, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+  combinedScatter <- plot1 + plot2
+  combinedScatter
+
+  ggsave(file.path(resDir, "combinedScatter.png"),
+         plot = combinedScatter, width = 20, height = 8, bg = "white")
+  
+  # Filter
+  
+  totalBefore <- totalBefore + ncol(cb)
+  
+  mdata <- cb@meta.data
+  
+  print("Filtering...")
+  
+  print(paste0("before filter: ", ncol(cb)))
+  
+  lower_feature_cutoff <- 300
+  upper_feature_cutoff <- 4000
+
+  lower_umi_cutoff <- 300
+  upper_umi_cutoff <- 8000
+
+  cb <- subset(cb, subset = percent.mt < 5 & 
+                 nFeature_RNA <= upper_feature_cutoff &
+                 nFeature_RNA >= lower_feature_cutoff &
+                 nCount_RNA <= upper_umi_cutoff &
+                 nCount_RNA >= lower_umi_cutoff)
+  
+  print(paste0("after filter: ", ncol(cb)))
+  
+  totalCells <- totalCells + ncol(cb)
+  
+  # Normalize
+  
+  print("Normalization...")
+  cb <- NormalizeData(object = cb,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000 )
+  
+  # Find Variable Genes
+  
+  print("Finding Variable Features...")
+  cb <- FindVariableFeatures(
+    cb,
+    selection.method = "mean.var.plot",
+    mean.cutoff = c(0.0125, 3),
+    dispersion.cutoff = c(0.5, Inf)
+  )
+
+  print(paste0("# Features: ", length(VariableFeatures(cb)))) # check num genes
+
+  cb <- ScaleData(object = cb, verbose = TRUE)
+
+  print("Dimensionality reduction...")
+  cb <- RunPCA(
+    cb,
+    features = VariableFeatures(cb),
+    verbose = FALSE
+  )
+  
+  PC_ElbowPlot <- ElbowPlot(cb, ndims = 20)
+  
+  ggsave(file.path(resDir, "PC_ElbowPlot.png"), plot = PC_ElbowPlot, width = 12, height = 8, bg = "white")
+
+  set.seed(42)
+  
+  cb <- FindNeighbors(
+    cb,
+    dims = 1:ndim,
+    verbose = FALSE
+  )
+
+  cb <- FindClusters(
+    cb,
+    resolution = 0.75,
+    verbose = FALSE
+  )
+
+  print("Check clusters...")
+  table(Idents(cb))
+  levels(Idents(cb))
+  
+  print("tSNE...")
+  
+  cb <- RunTSNE(
+    cb,
+    dims = 1:ndim,
+    verbose = FALSE
+  )
+
+  tSNE_plot <- DimPlot(
+    cb,
+    reduction = "tsne",
+    label = TRUE
+  )
+  
+  ggsave(file.path(resDir, "tSNE_Plot.png"), 
+         plot = tSNE_plot,
+         width = 8,
+         height = 6,
+         bg = "white")
+  
+
+  print("UMAP...")
+
+  cb <- RunUMAP(
+    cb,
+    dims = 1:ndim,
+    verbose = FALSE,
+    seed.use = 42
+  )
+
+  umap_plot <- DimPlot(
+    cb,
+    reduction = "umap"
+  )
+  
+  ggsave(file.path(resDir, "UMAP_Plot.png"),
+         plot = umap_plot,
+         width = 8,
+         height = 6,
+         bg = "white")
+  
+
+  print("Find DEGs...")
+  cb.markers <- FindAllMarkers(
+    cb,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+
+  top10 <- cb.markers %>%
+    group_by(cluster) %>%
+    slice_max(avg_log2FC, n = 10)
+
+  top10_per_cluster_heatmap <- DoHeatmap(
+    cb,
+    features = top10$gene
+  )
+  
+  ggsave(file.path(resDir, "top10_per_cluster_heatmap.png"), 
+         plot = top10_per_cluster_heatmap,
+         width = 12,
+         height = 4,
+         bg = "white")
+
+
+  print("Save result...")
+  saveRDS(
+    cb,
+    file.path(resDir, paste0(sID, "_object.rds"))
+  )
+
+
+  print("Save expression...")
+
+  clCounts <- extractClusterMatrix(cb)
+
+  write.table(
+    clCounts,
+    file.path(resDir, paste0(sID, "_cluster_expr_counts.txt")),
+    sep = "\t",
+    quote = FALSE,
+  )
+
+  # rpkmData <- convToRpkm(clCounts,geneLengths)
+  # write.table(rpkmData, paste0(resDir,sId,"_cluster_expr_RPKM.txt"),sep="\t",quote = F)
+
+  print("Done!")
+
+}
+
+```

@@ -1,0 +1,442 @@
+---
+title: "05 — Integration"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+library(here)
+
+source(here("Ghasemi_analysis", "R", "setup.R"))
+source(here("Ghasemi_analysis", "R", "functions.R"))
+
+```
+
+## Import Object
+
+```{r}
+
+sample_files <- list.files(
+  path = here("Ghasemi_analysis", "results", "sample_results"),
+  pattern = "_object_with_SingleR\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+sample_files
+
+```
+
+## Processing
+
+```{r}
+
+objs <- lapply(sample_files, readRDS)
+
+for (i in seq_along(objs)) {
+  sample_id <- objs[[i]]@project.name
+  
+  objs[[i]]$sample <- sample_id
+  objs[[i]]$protocol <- "10X"
+}
+
+combined <- merge(
+  x = objs[[1]],
+  y = objs[-1]
+)
+
+rm(objs)
+
+preHarmonyProcessing <- function(sobj) {
+  
+  print("Normalizing Combined Data...")
+  sobj <- NormalizeData(
+      sobj,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000
+  )
+  
+  print("Finding Variable Features...")
+  sobj <- FindVariableFeatures(
+      sobj,
+      selection.method = "vst",
+      nfeatures = 3000
+  )
+  print("Scaling Combined Data...")
+  sobj <- ScaleData(
+      sobj,
+      vars.to.regress = c(
+          "nCount_RNA",
+          "percent.mt"
+      )
+  )
+  
+  print("Running PCA...")
+  sobj <- RunPCA(
+      sobj,
+      features = VariableFeatures(sobj),
+      verbose = FALSE
+  )
+  
+  sobj <- RunUMAP(
+      sobj,
+      reduction = "pca",
+      dims = 1:15,
+      seed.use = 20200204
+  )
+  
+  preHarmony <- DimPlot(
+      sobj,
+      reduction = "umap",
+      group.by = "sample",
+  )
+  
+  ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "preHarmony_Plot.png"),
+         plot = preHarmony,
+         width = 12,
+         height = 10,
+         bg = "white")
+  
+  return(sobj)
+  
+}
+
+combined <- preHarmonyProcessing(combined)
+
+```
+
+```{r}
+
+harmonyProcessing <- function(sobj) {
+  
+  set.seed(20200204)
+  
+  sobj <- RunHarmony(
+    sobj,
+    group.by.vars = "sample",
+    theta = 2
+  )
+  
+  ndim <- 15
+  
+  sobj <- FindNeighbors(
+      sobj,
+      reduction = "harmony",
+      dims = 1:ndim
+  )
+  
+  sobj <- FindClusters(
+      sobj,
+      resolution = 0.225,
+      random.seed = 20200204
+  )
+  
+  sobj <- RunUMAP(
+      sobj,
+      reduction = "harmony",
+      dims = 1:ndim,
+      seed.use = 20200204,
+      min.dist = 0.1
+  )
+  
+  sobj <- JoinLayers(sobj)
+  
+  combinedDimPlot <- DimPlot(
+    sobj,
+    reduction = "umap",
+    group.by = "RNA_snn_res.0.225"
+  )
+  
+  ggsave(file.path(here("Ghasemi_analysis", "results", "combined"), "combined_Dim_Plot.png"),
+         plot = combinedDimPlot,
+         width = 12,
+         height = 10,
+         bg = "white")
+  
+  return(sobj)
+
+}
+
+combined <- harmonyProcessing(combined)
+saveRDS(combined, file.path(here("Ghasemi_analysis", "results", "combined"), "combined.rds"))
+
+```
+
+```{r}
+
+# Specific function to run entire integration workflow
+
+runIntegration <- function(sobj) {
+  
+  sobj <- preHarmonyProcessing(sobj)
+  sobj <- harmonyProcessing(sobj)
+  return(sobj)
+}
+
+# removal of visually identified non-malignant clusters and re-running of processing
+# combined <- readRDS(file.path(here(), "Ghasemi_analysis", "results", "combined",
+#                               "combined.rds"))
+
+combined <- subset(combined, idents = c("7", "8", "9"), invert = TRUE)
+
+library(scDblFinder)
+library(SingleCellExperiment)
+sce <- as.SingleCellExperiment(combined)
+sce <- scDblFinder(sce, samples = "sample")   # add samples = "sample" if multi-sample
+combined$dbl_class <- sce$scDblFinder.class
+DimPlot(combined, group.by = "dbl_class")
+table(combined$dbl_class)
+
+combined <- subset(combined, subset = dbl_class == "singlet")
+
+
+saveRDS(
+  combined,
+  file.path(
+    here(),
+    "Ghasemi_analysis",
+    "results",
+    "combined",
+    "malignant_base_before_reintegration.rds"
+  )
+)
+
+combined <- runIntegration(combined)
+saveRDS(combined, file.path(here("Ghasemi_analysis", "results", "combined"), "combined.rds"))
+
+```
+
+```{r}
+
+# CLUSTERING STABILITY #
+
+
+############################################################
+# 1. FUNCTION TO EXTRACT AND SAVE RESULTS
+############################################################
+
+saveClusterResults <- function(
+    sobj,
+    iteration_name,
+    cluster_column = "RNA_snn_res.0.175",
+    output_dir = "cluster_comparison_results"
+) {
+  
+  # Create output directory if needed
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # --------------------------------------------------------
+  # Cell-level information
+  # --------------------------------------------------------
+  
+  cell_assignments <- data.frame(
+    cell = colnames(sobj),
+    sample = sobj$sample,
+    cluster = sobj[[cluster_column]][, 1],
+    stringsAsFactors = FALSE
+  )
+  
+  
+  # --------------------------------------------------------
+  # Cluster sizes
+  # --------------------------------------------------------
+  
+  cluster_sizes <- as.data.frame(
+    table(cell_assignments$cluster)
+  )
+  
+  colnames(cluster_sizes) <- c(
+    "cluster",
+    "n_cells"
+  )
+  
+  
+  # --------------------------------------------------------
+  # Sample × cluster counts
+  # --------------------------------------------------------
+  
+  sample_cluster_counts <- table(
+    cell_assignments$sample,
+    cell_assignments$cluster
+  )
+  
+  
+  # --------------------------------------------------------
+  # Sample × cluster proportions
+  #
+  # Each row sums to 1, so this tells us how each sample's
+  # cells are distributed across clusters.
+  # --------------------------------------------------------
+  
+  sample_cluster_props <- prop.table(
+    sample_cluster_counts,
+    margin = 1
+  )
+  
+  
+  # --------------------------------------------------------
+  # Save everything as one small RDS
+  # --------------------------------------------------------
+  
+  results <- list(
+    iteration = iteration_name,
+    cell_assignments = cell_assignments,
+    cluster_sizes = cluster_sizes,
+    sample_cluster_counts = sample_cluster_counts,
+    sample_cluster_props = sample_cluster_props
+  )
+  
+  saveRDS(
+    results,
+    file = file.path(
+      here(),
+      "Ghasemi_analysis",
+      "results",
+      "cluster_stability",
+      paste0(iteration_name, "_cluster_results.rds")
+    )
+  )
+  
+  # Return results invisibly in case we want to inspect them
+  invisible(results)
+}
+
+
+dir.create(
+  file.path(
+    here(),
+    "Ghasemi_analysis",
+    "results",
+    "cluster_stability"
+  ),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+sample_order <- c(
+  "AK1",
+  "MB295",
+  "MB299",
+  "MB287",
+  "AK3",
+  "MB266",
+  "MB263",
+  "MB88",
+  "AK2"
+)
+
+
+for (n in 9:2) {
+  
+  print("-------------------------")
+  print(paste0("Running ", n, "-sample integration"))
+  print("-------------------------")
+  
+  if (n != 9) {
+    keep_samples <- sample_order[1:n]
+    
+    combined <- subset(
+      combined, 
+      subset = sample %in% keep_samples
+    )
+    
+    combined <- runIntegration(combined)
+  }
+  
+  
+  saveClusterResults(combined, n)
+  
+}
+
+result_files <- list.files(
+  here("Ghasemi_analysis", "results", "cluster_stability"),
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+
+results <- lapply(result_files, readRDS)
+
+names(results) <- sapply(results, function(x) x$iteration)
+
+reference <- results[["9"]]
+
+ref_assign <- reference$cell_assignments
+
+comparison <- function(n) {
+  
+  test_assign <- results[[as.character(n)]]$cell_assignments
+  
+  comparison_9vX <- inner_join(
+    ref_assign,
+    test_assign,
+    by = "cell",
+    suffix = c("_reference", "_reduced")
+  )
+  
+  comparison_9vX <- comparison_9vX %>%
+    dplyr::select(
+      cell,
+      sample = sample_reference,
+      cluster_reference,
+      cluster_reduced
+    )
+  
+  overlap_comparison <- comparison_9vX %>%
+    dplyr::count(
+      cluster_reference,
+      cluster_reduced,
+      name = "cell_count"
+    )
+  
+  overlap_comparison <- overlap_comparison %>%
+    group_by(cluster_reference) %>%
+    mutate(
+      reference_cluster_total = sum(cell_count),
+      proportion = cell_count / reference_cluster_total
+    ) %>%
+    ungroup()
+  
+  overlap_comparison_plot <- ggplot(
+    overlap_comparison,
+    aes(
+      x = factor(cluster_reduced),
+      y = factor(cluster_reference),
+      fill = proportion
+    )
+  ) +
+    geom_tile() +
+    geom_text(
+      aes(label = sprintf("%.2f", proportion))
+    ) +
+    labs(
+      x = paste0("Cluster in ", n , "-sample integration"),
+      y = "Cluster in 9-sample reference",
+      fill = "Proportion",
+      title = paste0("Cluster stability: 9 samples vs ", n, " samples")
+    ) +
+    theme_minimal()
+  
+  overlapfilename <- paste0("overlap_9v", n, "_plot.png")
+  
+  ggsave(
+    file.path(
+      here(),
+      "Ghasemi_analysis", 
+      "results",
+      "cluster_stability",
+      overlapfilename),
+    plot = overlap_comparison_plot,
+    width = 12,
+    height = 10,
+    bg = "white")
+}
+
+for (i in 8:2) {
+  comparison(i)
+}
+
+
+```
