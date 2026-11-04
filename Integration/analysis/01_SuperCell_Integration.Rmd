@@ -34,14 +34,27 @@ sc_files <- list.files(
 sc_files
 
 scs <- lapply(sc_files, readRDS)
+
+## Retrieve shared features across datasets
+
 feature_list <- lapply(scs, rownames)
 
-shared.features <- Reduce(f = intersect, x = feature_list)
+#  Some features have numbered suffix despite being the same feature
+#  Removing suffix to accurately retrieve shared features
 
+suffix_pattern <- "\\.[0-9]+$"
+clean_feature_list <- lapply(feature_list, 
+                             function(x) sub(suffix_pattern, "", x))
+shared.features_clean <- Reduce(f = intersect, x = clean_feature_list)
+union_features_clean <- Reduce(f = union, x = clean_feature_list)
+not_shared_features_clean <- setdiff(union_features_clean, shared.features_clean)
+
+#  Subsetting objects with shared features only
 scs_shared_only <- lapply(scs, function(obj) {
-  return(obj[shared.features, ])
+  return(obj[shared.features_clean, ])
 })
 
+## Merging SuperCell objects
 scs_merged <- merge(x = scs_shared_only[[1]], y = scs_shared_only[-1])
 
 rm(scs)
