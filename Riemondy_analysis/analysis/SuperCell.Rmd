@@ -58,7 +58,7 @@ for (s in unique(o$UPN)) {
   
   # Majority cell type + size per supercell
   meta <- data.frame(ct = obj$tumor_subpopulation[names(scell$membership)],
-                   sc = scell$membership) |>
+                     sc = scell$membership) |>
   dplyr::group_by(sc) |>
   dplyr::summarize(
     cell_type = names(which.max(table(ct))),
@@ -102,7 +102,10 @@ for (s in unique(o$UPN)) {
 
 merged <- merge(sc_list[[1]], sc_list[-1])
 merged <- JoinLayers(merged)
-merged <- NormalizeData(merged) |> FindVariableFeatures() |> ScaleData() |> RunPCA()
+merged <- NormalizeData(merged) |> 
+  FindVariableFeatures() |> 
+  ScaleData() |> 
+  RunPCA()
 merged <- RunHarmony(
   merged,
   group.by.vars = "pt_id",
@@ -237,7 +240,8 @@ without_supercell$sc_purity  <- sc_meta[without_supercell$sc_id, "purity"]
 
 # How do original cell types map to SC cell types?
 contingency_matrix <- table(original = without_supercell$tumor_subpopulation,
-      sc_celltype = without_supercell$sc_celltype, useNA = "ifany")
+                            sc_celltype = without_supercell$sc_celltype, 
+                            useNA = "ifany")
 
 prob_matrix <- prop.table(contingency_matrix, margin = 1) * 100
 
@@ -271,8 +275,14 @@ p_sc_cluster <- DimPlot(without_supercell,
   labs(title = "Original cells colored by SC-cell type")
 
 # Supercell size and purity per cell
-p_size   <- FeaturePlot(without_supercell, "sc_size",   reduction = "umap", raster = FALSE)
-p_purity <- FeaturePlot(without_supercell, "sc_purity", reduction = "umap", raster = FALSE)
+p_size   <- FeaturePlot(without_supercell, 
+                        "sc_size",
+                        reduction = "umap", 
+                        raster = FALSE)
+p_purity <- FeaturePlot(without_supercell, 
+                        "sc_purity", 
+                        reduction = "umap", 
+                        raster = FALSE)
 
 all3 <- p_sc_cluster | p_size | p_purity
 
@@ -316,8 +326,12 @@ centroids <- emb |>
   dplyr::mutate(sc_celltype = sc_meta[sc_id, "cell_type"])
 
 ggplot() +
-  geom_point(data = emb, aes(UMAP_1, UMAP_2), color = "grey85", size = 0.2) +
-  geom_point(data = centroids, aes(UMAP_1, UMAP_2, size = n, color = sc_celltype),
+  geom_point(data = emb, 
+             aes(UMAP_1, UMAP_2), 
+             color = "grey85", 
+             size = 0.2) +
+  geom_point(data = centroids, 
+             aes(UMAP_1, UMAP_2, size = n, color = sc_celltype),
              alpha = 0.8) +
   scale_size_continuous(range = c(0.5, 6)) +
   theme_classic() +
@@ -325,8 +339,12 @@ ggplot() +
 
 ## IS GAP PATIENT SPECIFIC?
 
-DimPlot(without_supercell, reduction = "umap", group.by = "tumor_subpopulation",
-        split.by = "UPN", ncol = 4, raster = FALSE)
+DimPlot(without_supercell, 
+        reduction = "umap", 
+        group.by = "tumor_subpopulation",
+        split.by = "UPN", 
+        ncol = 4, 
+        raster = FALSE)
 
 ```
 
@@ -373,8 +391,11 @@ make_marker_heatmaps <- function(markers, marker_prefix = "C", n_per_cluster = 6
                       levels = unique(paste0(marker_prefix, top$cluster, " markers")))
 
   avg_z <- function(obj, group_by, prefix) {
-    a <- AverageExpression(obj, features = genes, group.by = group_by,
-                           assays = "RNA", layer = "data")$RNA
+    a <- AverageExpression(obj, 
+                           features = genes, 
+                           group.by = group_by,
+                           assays = "RNA",
+                           layer = "data")$RNA
     a <- log1p(as.matrix(a))
     colnames(a) <- sub("^g", "", colnames(a))
     a <- a[genes, order(as.numeric(colnames(a))), drop = FALSE]
@@ -412,17 +433,24 @@ make_marker_heatmaps <- function(markers, marker_prefix = "C", n_per_cluster = 6
   ht <- mk(z1, "Single cells\nsingle-cell clusters", first = TRUE) +
         mk(z2, "Supercells\nsupercell clusters")
   draw(ht,
-       column_title = paste0("Top ", n_per_cluster, " markers per cluster (selected from ",
-                             source_label, " data)"),
+       column_title = paste0("Top ", 
+                             n_per_cluster, 
+                             " markers per cluster (selected from ",
+                             source_label,
+                             " data)"),
        column_title_gp = gpar(fontsize = 12, fontface = "bold"),
        heatmap_legend_side = "right", padding = unit(c(2, 2, 2, 8), "mm"))
 }
 
 # single-cell-derived markers (clusters labeled C0-C4)
-make_marker_heatmaps(objMarkers, marker_prefix = "C", source_label = "single-cell")
+make_marker_heatmaps(objMarkers, 
+                     marker_prefix = "C", 
+                     source_label = "single-cell")
 
 # supercell-derived markers (clusters labeled S0-S4)
-make_marker_heatmaps(scMarkers, marker_prefix = "S", source_label = "supercell")
+make_marker_heatmaps(scMarkers, 
+                     marker_prefix = "S", 
+                     source_label = "supercell")
 
 ```
 
